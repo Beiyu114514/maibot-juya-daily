@@ -885,6 +885,57 @@ class ImagePushTest(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_fallback_text_records_progress_and_resumes_remaining_pages(self) -> None:
+        """长图回退文本后失败：进度按页落盘，重试跳过长图、只补剩余页。"""
+
+        async def scenario() -> None:
+            send = FakeSend(fail_image=True, fail_pages={2})
+            render = FakeRender()
+            plugin = self._image_plugin(send, render)
+            plugin._store.subscribe("s1", "10001")
+            issue = make_long_issue("2026-10-19")
+            pages = plugin_module.paginate_issue(issue)
+            self.assertGreaterEqual(len(pages), 3)
+
+            self.assertFalse(await plugin._push_one("s1", issue))
+            self.assertEqual(len(render.calls), 1)  # 长图只渲染一次
+            self.assertEqual(len(send.image_calls), 1)  # 长图尝试过并失败
+            self.assertEqual(len(send.calls), 2)  # 文本第 1 页成功、第 2 页失败
+            state = plugin._store.push_state("s1")
+            self.assertEqual(state["date"], "2026-10-19")
+            self.assertEqual(state["page"], 1)
+            self.assertFalse(state["done"])
+
+            send.fail_pages.clear()
+            before = len(send.calls)
+            self.assertTrue(await plugin._push_one("s1", issue))
+            self.assertEqual(len(render.calls), 1)  # 重试不再渲染长图
+            self.assertEqual(len(send.calls) - before, len(pages) - 1)  # 只补剩余页
+            self.assertTrue(plugin._store.push_state("s1")["done"])
+            self.assertEqual(plugin._store.last_pushed_date("s1"), "2026-10-19")
+
+        asyncio.run(scenario())
+
+    def test_fallback_resume_skips_render_when_progress_exists(self) -> None:
+        """进度显示已进入文本回退时，重试直接续发，不再渲染/发送长图。"""
+
+        async def scenario() -> None:
+            send = FakeSend()
+            render = FakeRender()
+            plugin = self._image_plugin(send, render)
+            plugin._store.subscribe("s1", "10001")
+            issue = make_long_issue("2026-10-19")
+            pages = plugin_module.paginate_issue(issue)
+            plugin._store.set_push_progress("s1", "2026-10-19", page=1, done=False)
+
+            self.assertTrue(await plugin._push_one("s1", issue))
+            self.assertEqual(render.calls, [])
+            self.assertEqual(send.image_calls, [])
+            self.assertEqual(len(send.calls), len(pages) - 1)
+            self.assertTrue(plugin._store.push_state("s1")["done"])
+
+        asyncio.run(scenario())
+
     def test_text_mode_never_renders(self) -> None:
         async def scenario() -> None:
             render = FakeRender()

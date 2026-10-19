@@ -8,13 +8,14 @@
 
 - **长图推送**：`message_format` 新增 `"image"`。整期早报渲染成自包含 HTML（标题、导语、条目、脚注，无外部资源），经宿主 `render.html2png` 截成一张竖版长图后用 `send.image` 发出（QQ 富媒体 `msg_type=7`），QQ 官方机器人与 NapCat/SnowLuma 本地客户端路线都能显示
 - 新增 `image_width`（默认 760 CSS px）、`image_scale`（2.0）、`image_max_height`（16000 px）、`image_timeout_ms`（30000 ms）配置；渲染能力不可用、截图失败、图片发送失败或高度超限时，整期自动回退纯文本
-- 长图进度按「整期一张」记录，失败重试重发整张图；`/早报` 与定时推送共用同一发送路径
+- 长图进度按「整期一张」记录，失败重试重发整张图；渲染/发送失败回退纯文本时改为按页记录进度（`{date, page, done}`），重试跳过长图渲染、只补剩余文本页，避免每轮重渲染并从第 1 页重发；`/早报` 与定时推送共用同一发送路径
 - manifest 新增 `send.image` 与 `render.html2png` 能力声明
 
 ### 工程化
 
 - formatter 新增 `render_issue_html()`（纯文本/HTML 转义、系统字体栈、内联样式）与 `IMAGE_CARD_WIDTH`
-- 测试 176 → 185：长图 HTML 结构/转义/宽度、渲染成功路径、渲染异常/空结果/高度超限/发送失败回退、文本模式不触发渲染
+- CI：`pull_request` 不再限制 base 分支，stacked PR（以 feature 分支为 base）也会触发测试，合入前不再出现 0 个 check
+- 测试 176 → 187：长图 HTML 结构/转义/宽度、渲染成功路径、渲染异常/空结果/高度超限/发送失败回退、文本模式不触发渲染、回退文本断点续传（失败后只补剩余页 / 已有进度时跳过长图渲染）
 - 版本 0.5.0（manifest / README / config.example.toml 同步）
 
 ## [0.4.0] - 2026-10-19

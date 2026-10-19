@@ -4,8 +4,8 @@ on:
   push:
     branches: [main]
     tags: ["v*"]          # 推 tag 时跑测试 + 打包发 Release
-  pull_request:
-    branches: [main]
+  pull_request:           # 不限制 base 分支：stacked PR（如 #3 以 feat/qq-markdown-push 为 base）
+                          # 也必须跑测试，否则合入前 CI 永远是 0 个 check
   workflow_dispatch:      # 也允许在 Actions 页面手动触发
   schedule:
     - cron: "0 22 * * *"  # 每天 22:00（UTC）跑一次真实站点集成测试

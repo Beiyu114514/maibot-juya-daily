@@ -69,8 +69,8 @@ image_timeout_ms = 30000  # 渲染超时
 ```
 
 - 需要宿主开启浏览器渲染：MaiBot 配置 `plugin_runtime.render.enabled = true`（默认开启），并确保 Playwright/Chromium 可用。
-- 渲染不可用、截图失败、图片发送失败或高度超限时，整期自动回退纯文本，不会让推送彻底失败。
-- 长图模式按「整期一张」记录推送进度，失败重试会重发整张图。
+- 渲染不可用、截图失败、图片发送失败或高度超限时，整期自动回退纯文本，不会让推送彻底失败；回退后按文本页记录进度，重试只补剩余页。
+- 长图模式按「整期一张」记录推送进度，失败重试会重发整张图；一旦已回退纯文本并发出部分页，重试会跳过长图渲染，只续发剩余文本页（不会每轮重新渲染并从第 1 页刷屏）。
 - HTML 使用系统字体栈（Noto Sans CJK / 苹方 / 微软雅黑等），不加载任何外部资源，离线也能渲染。
 
 ## 配置（config.toml）
@@ -108,7 +108,7 @@ stale_deadline = "12:00"   # 当天一期超过这个时间还没发布就放弃
 - **无 SDK 定时组件**，插件用 asyncio 后台任务自建每日定时器；热重载（新建 Runner 进程）时任务随插件卸载而取消，状态由落盘保证。
 - **容错**：RSS/Atom 宽容解析 + HTML 兜底；日期优先从标题/正文抽取（pubDate 仅兜底）；推送失败按 `retry_minutes × retry_times` 重试；当天早报未发布时每 30 分钟重查，到 `stale_deadline` 放弃。
 - **风控友好**：启动补推与多群推送并发发起，各目标随机错峰 30–120 秒（`stagger_min_seconds` / `stagger_max_seconds`），单目标重复触发会被进程内去重。
-- **分页发送**：整期内容按「条」打包成多条消息，纯文本单条不超过 1800 字、Markdown 单条不超过 3800 字，避免被 QQ 截断；末页带来源脚注。长图模式则整期渲染成一张图，失败回退纯文本分页。
+- **分页发送**：整期内容按「条」打包成多条消息，纯文本单条不超过 1800 字、Markdown 单条不超过 3800 字，避免被 QQ 截断；末页带来源脚注。长图模式则整期渲染成一张图，失败回退纯文本分页，进度按页落盘、重试只补剩余页。
 - **链接格式兼容**：站点早期用 `/issue-N/`、现改为 `/issues/YYYY-MM-DD/`，RSS 与 HTML 兜底两种都认。
 
 ## 开发
@@ -116,7 +116,7 @@ stale_deadline = "12:00"   # 当天一期超过这个时间还没发布就放弃
 ```bash
 # 在 MaiBot 仓库的 plugins/ 目录下（或任意位置）跑：
 python3 -m py_compile plugins/juya-daily/*.py          # 语法检查
-python3 -m unittest discover -s tests -v               # 单元测试（145 项）
+python3 -m unittest discover -s tests -v               # 单元测试（187 项）
 JUYA_LIVE=1 python3 -m unittest tests.test_live_rss -v # 真实站点冒烟（默认跳过）
 ```
 
