@@ -8,13 +8,13 @@
   <img alt="Platform" src="https://img.shields.io/badge/MaiBot-%E6%8F%92%E4%BB%B6-orange">
 </p>
 
-MaiBot 插件：订阅 [橘鸦AI早报](https://daily.juya.uk/)，每天定时把最新一期 AI 资讯推送到订阅的群/会话（默认纯文本，可选 QQ Markdown），也支持 `/早报` 随时查看。
+MaiBot 插件：订阅 [橘鸦AI早报](https://daily.juya.uk/)，每天定时把最新一期 AI 资讯推送到订阅的群/会话（默认纯文本，可选 QQ Markdown / 长图），也支持 `/早报` 随时查看。
 
 数据源为站点官方 RSS `https://daily.juya.uk/rss.xml`（每期全文内嵌），HTML 解析仅作兜底。
 
 ## ✨ 功能
 
-- **每日定时推送**：每天 `push_time` 自动推送最新一期（纯文本或 QQ Markdown，无需图片/LLM）
+- **每日定时推送**：每天 `push_time` 自动推送最新一期（纯文本 / QQ Markdown / 长图，无需 LLM）
 - **群内自助订阅**：`/早报订阅` `/早报退订` 即刻生效，状态落盘不怕重启
 - **即取即看**：`/早报` 随时拉最新一期
 - **可靠推送**：启动补推、失败重试（多页断点续传，只补失败页）、当天未发布则每 30 分钟重查
@@ -74,7 +74,7 @@ MaiBot/
 | `/早报退订` | 取消订阅（当前会话） |
 | `/早报状态` | 查看订阅状态、推送时间与最近一期 |
 
-推送内容为日期标题 + 编号条目 + 脚注（含原文链接与「AI 辅助生成，可能存在错误」提示）。默认纯文本；把 `[push] message_format` 设为 `"markdown"` 后使用 QQ Markdown（标题、加粗、可点击原文链接），需要 [WhiteCloudOL/qq-official-adapter](https://github.com/WhiteCloudOL/qq-official-adapter) 等支持 `qq_markdown` 结构化消息的适配器，发送失败会自动回退纯文本。
+推送内容为日期标题 + 编号条目 + 脚注（含原文链接与「AI 辅助生成，可能存在错误」提示）。默认纯文本；把 `[push] message_format` 设为 `"markdown"` 后使用 QQ Markdown（标题、加粗、可点击原文链接），需要 [WhiteCloudOL/qq-official-adapter](https://github.com/WhiteCloudOL/qq-official-adapter) 等支持 `qq_markdown` 结构化消息的适配器，发送失败会自动回退纯文本。设为 `"image"` 则整期渲染成一张竖版长图（走宿主 `render.html2png` + `send.image`），QQ 官方机器人与本地客户端路线都能显示，渲染/发送失败同样回退纯文本。
 
 ## ⚙️ 配置
 
@@ -89,7 +89,11 @@ static_platform = "qq"
 admin_only = false         # 仅管理员可订阅/退订
 
 [push]
-message_format = "text"    # text=纯文本；markdown=QQ Markdown（需适配器支持 qq_markdown 段）
+message_format = "text"    # text=纯文本；markdown=QQ Markdown；image=长图
+image_width = 760          # 长图宽度（CSS 像素）
+image_scale = 2.0          # 长图清晰度（设备像素比）
+image_max_height = 16000   # 长图像素高度上限，超过回退纯文本
+image_timeout_ms = 30000   # 长图渲染超时（毫秒）
 max_items = 0              # 每期最多推几条，0 = 全部
 footer = "…"               # 脚注模板，支持 {link} {date} {title}
 retry_minutes = 10         # 推送失败重试间隔
@@ -109,7 +113,7 @@ stale_deadline = "12:00"   # 当天一期超过这个时间还没发布就放弃
 - **无 SDK 定时组件**，插件用 asyncio 后台任务自建每日定时器；热重载（新建 Runner 进程）时任务随插件卸载而取消，状态由落盘保证。
 - **容错**：RSS/Atom 宽容解析 + HTML 兜底；推送失败按 `retry_minutes × retry_times` 重试；当天早报未发布时每 30 分钟重查，到 `stale_deadline` 放弃。
 - **风控友好**：启动补推与多群推送并发发起，各目标随机错峰 30–120 秒（`stagger_min_seconds` / `stagger_max_seconds`）。
-- **分页与格式**：纯文本单条 ≤1800 字，Markdown 单条 ≤3800 字（适配器硬上限 4000），二者都自动分页并带页码。
+- **分页与格式**：纯文本单条 ≤1800 字，Markdown 单条 ≤3800 字（适配器硬上限 4000），二者都自动分页并带页码；长图模式整期一张，超过 `image_max_height` 或渲染失败时回退纯文本。
 
 ## 🏗️ 开发
 
@@ -117,7 +121,7 @@ stale_deadline = "12:00"   # 当天一期超过这个时间还没发布就放弃
 # 语法检查
 python3 -m py_compile plugins/juya-daily/*.py
 
-# 单元测试（176 项：RSS 解析 / 排版分页 / Markdown 渲染与回退 / 状态落盘与迁移 / 定时器 / 推送成败与断点续传 / 并发去重 / SDK 注入契约 / 配置模型可实例化 / 安装包结构）
+# 单元测试（185 项：RSS 解析 / 排版分页 / Markdown 渲染与回退 / 长图 HTML 与回退 / 状态落盘与迁移 / 定时器 / 推送成败与断点续传 / 并发去重 / SDK 注入契约 / 配置模型可实例化 / 安装包结构）
 python3 -m unittest discover -s tests -v
 
 # 真实站点集成测试（会请求 daily.juya.uk，默认跳过）
@@ -127,7 +131,7 @@ JUYA_LIVE=1 python3 -m unittest tests.test_live_rss -v
 python3 scripts/package_plugin.py
 
 # 发版：manifest 版本必须与 tag 一致，推 v* tag 后 Actions 自动测试、打包并发布 Release
-git tag v0.4.0 && git push origin v0.4.0
+git tag v0.5.0 && git push origin v0.5.0
 ```
 
 测试不需要真实 MaiBot 环境：缺 `pydantic` / `maibot_sdk` 时会自动注入最小桩（CI 里装真包，走真实实现）。桩按真实 SDK 可见面对齐（`ctx`/`config` 只读、经 `_set_context` / `set_plugin_config` 注入、`Command` 写 `__maibot_component_info__`），本地与 CI 覆盖同一代码路径；要装真包：`pip install -r requirements-dev.txt`。
@@ -142,7 +146,7 @@ tests/                        # unittest：test_fetcher / test_formatter / test_
 plugins/juya-daily/
 ├── plugin.py      # 入口：命令、生命周期、推送编排
 ├── fetcher.py     # RSS 抓取解析（HTML 兜底、重试、当日缓存）
-├── formatter.py   # 纯文本 / QQ Markdown 排版（分条、限条数、分页、脚注）
+├── formatter.py   # 纯文本 / QQ Markdown / 长图 HTML 排版（分条、限条数、分页、脚注）
 ├── scheduler.py   # 每日定时器（可热改时间）
 └── store.py       # 订阅状态持久化（原子写）
 ```

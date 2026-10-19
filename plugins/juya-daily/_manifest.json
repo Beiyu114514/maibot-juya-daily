@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
   "id": "com.juya.daily",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "name": "橘鸦AI早报",
-  "description": "订阅 https://daily.juya.uk/ 每日 AI 资讯早报：群内自助订阅，每天定时推送（纯文本 / QQ Markdown），支持 /早报 即取即看与失败重试。",
+  "description": "订阅 https://daily.juya.uk/ 每日 AI 资讯早报：群内自助订阅，每天定时推送（纯文本 / QQ Markdown / 长图），支持 /早报 即取即看与失败重试。",
   "author": {
     "name": "Beiyu114514",
     "url": "https://github.com/Beiyu114514"
@@ -25,7 +25,9 @@
     "send.text",
     "send.custom",
     "chat.get_stream_by_group_id",
-    "config.get_plugin"
+    "config.get_plugin",
+    "send.image",
+    "render.html2png"
   ],
   "i18n": {
     "default_locale": "zh-CN",
