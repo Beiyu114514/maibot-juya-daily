@@ -7,7 +7,7 @@ enabled = true
 config_version = "2.0.0"
 
 [schedule]
-# 每日推送时间（部署机本地时区，HH:MM）
+# 每日推送时间（固定东八区 UTC+8，HH:MM）
 push_time = "09:30"
 # 启动时若已过推送时间且今天还没推，自动补发今天一期
 catch_up_on_start = true
@@ -33,5 +33,8 @@ footer = """
 retry_minutes = 10
 # 当天推送失败的最大重试轮数
 retry_times = 3
+# 多群推送错峰：同一批第 2 个及以后目标随机等待 [min, max] 秒
+stagger_min_seconds = 30
+stagger_max_seconds = 120
 # 今天的早报到几点还没发布就放弃当天推送（HH:MM）
 stale_deadline = "12:00"

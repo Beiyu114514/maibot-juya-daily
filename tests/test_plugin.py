@@ -180,6 +180,21 @@ def make_issue(date: str, title: str = "橘鸦AI早报") -> Issue:
     )
 
 
+def make_long_issue(date: str, items: int = 24) -> Issue:
+    """足够长、能分出 3 页以上的期，用于断点续传测试。"""
+    body = "\n\n".join(
+        f"第 {i} 条标题 #{i}\n" + "长正文内容" * 80 for i in range(1, items + 1)
+    )
+    return Issue(
+        title=f"橘鸦AI早报 {date}",
+        link=f"https://daily.juya.uk/issues/{date}/",
+        date=date,
+        pub_dt=datetime.now(timezone.utc),
+        content=body,
+        source="rss",
+    )
+
+
 class FakeSend:
     """记录发送内容，可按 stream_id 模拟失败/抛异常。"""
 
@@ -293,6 +308,33 @@ class _patch:
         return False
 
 
+class _FakeTime:
+    """只替换插件模块内的 time，避免污染 asyncio 自己的时钟。"""
+
+    def __init__(self, values):
+        self._values = list(values)
+        self._last = self._values[-1] if self._values else 0.0
+
+    def monotonic(self):
+        if self._values:
+            self._last = self._values.pop(0)
+        return self._last
+
+
+class _SleepProxy:
+    """代理 asyncio：只记录 sleep 延迟，其余原样转发（gather/Semaphore 等）。"""
+
+    def __init__(self, real):
+        self._real = real
+        self.delays: list[float] = []
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    async def sleep(self, delay):
+        self.delays.append(delay)
+
+
 class EntryPointTest(unittest.TestCase):
     def test_create_plugin(self) -> None:
         self.assertIsInstance(create_plugin(), JuyaDailyPlugin)
@@ -332,6 +374,13 @@ class CommandRoutingTest(unittest.TestCase):
             set(self._commands()),
             {"juya_daily", "juya_daily_sub", "juya_daily_unsub", "juya_daily_status"},
         )
+
+    def test_commands_have_description(self) -> None:
+        """WebUI/帮助列表直接展示 @Command description，不能为空。"""
+        for name in dir(JuyaDailyPlugin):
+            info = getattr(getattr(JuyaDailyPlugin, name), "__maibot_component_info__", None)
+            if info is not None:
+                self.assertTrue(info.description, f"{info.name} 缺少 description")
 
     def test_patterns_do_not_overlap(self) -> None:
         patterns = self._commands()
@@ -401,6 +450,8 @@ class ConfigModelTest(unittest.TestCase):
         self.assertTrue(cfg.plugin.enabled)
         self.assertEqual(cfg.schedule.push_time, "09:30")
         self.assertEqual(cfg.push.max_items, 0)
+        self.assertEqual(cfg.push.stagger_min_seconds, 30)
+        self.assertEqual(cfg.push.stagger_max_seconds, 120)
 
     def test_instantiable_with_partial_override(self) -> None:
         cfg = JuyaDailyConfig(schedule={"push_time": "07:15", "catch_up_on_start": False})
@@ -552,7 +603,8 @@ class PushTest(unittest.TestCase):
             plugin._store.subscribe("s1", "10001")
             plugin._store.subscribe("s2", "10002")
             plugin._store.unsubscribe("s2")  # 推送前退订
-            await plugin._push_round(["s1", "s2"], make_issue("2026-10-19"))
+            with no_stagger():
+                await plugin._push_round(["s1", "s2"], make_issue("2026-10-19"))
             pushed = {stream_id for stream_id, _ in plugin.ctx.send.calls}
             self.assertEqual(pushed, {"s1"})
 
@@ -740,6 +792,284 @@ class LifecycleTest(unittest.TestCase):
             await plugin.on_unload()
 
         asyncio.run(scenario())
+
+
+class PushProgressTest(unittest.TestCase):
+    """多页断点续传：失败停在那一页，重试只补剩余页。"""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp()
+
+    def test_resume_from_failed_page(self) -> None:
+        async def scenario() -> None:
+            plugin = build_plugin(self.tmp, send=FakeSend(fail_pages={3}))
+            issue = make_long_issue("2026-10-19")
+            pages = plugin_module.paginate_issue(issue)
+            self.assertGreaterEqual(len(pages), 3)
+
+            self.assertFalse(await plugin._push_one("s1", issue))
+            state = plugin._store.push_state("s1")
+            self.assertEqual(state["date"], "2026-10-19")
+            self.assertEqual(state["page"], 2)  # 前两页成功，第 3 页失败
+            self.assertFalse(state["done"])
+            self.assertEqual(len(plugin.ctx.send.calls), 3)
+
+            plugin.ctx.send.fail_pages.clear()
+            before = len(plugin.ctx.send.calls)
+            self.assertTrue(await plugin._push_one("s1", issue))
+            # 只补发第 3 页起的剩余页，不重发前两页
+            self.assertEqual(len(plugin.ctx.send.calls) - before, len(pages) - 2)
+            self.assertTrue(plugin._store.push_state("s1")["done"])
+            self.assertEqual(plugin._store.last_pushed_date("s1"), "2026-10-19")
+
+        asyncio.run(scenario())
+
+    def test_done_state_does_not_resend(self) -> None:
+        async def scenario() -> None:
+            plugin = build_plugin(self.tmp)
+            issue = make_issue("2026-10-19")
+            plugin._store.set_last_pushed("s1", "2026-10-19")
+            self.assertTrue(await plugin._push_one("s1", issue))
+            self.assertEqual(plugin.ctx.send.calls, [])
+
+        asyncio.run(scenario())
+
+    def test_stale_page_restarts_when_pages_shrink(self) -> None:
+        """内容改版后页数变少，旧进度越界时应从头重发而不是永远跳过。"""
+        async def scenario() -> None:
+            plugin = build_plugin(self.tmp)
+            issue = make_issue("2026-10-19")
+            plugin._store.set_push_progress("s1", "2026-10-19", page=99, done=False)
+            self.assertTrue(await plugin._push_one("s1", issue))
+            self.assertTrue(plugin.ctx.send.calls)
+            self.assertEqual(plugin._store.last_pushed_date("s1"), "2026-10-19")
+
+        asyncio.run(scenario())
+
+
+class BatchPushTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp()
+
+    def test_exception_does_not_abort_other_targets(self) -> None:
+        async def scenario() -> None:
+            plugin = build_plugin(self.tmp)
+            plugin._store.subscribe("bad", "10001")
+            plugin._store.subscribe("good", "10002")
+            issue = make_issue("2026-10-19")
+            real_push_one = plugin._push_one
+
+            async def flaky(stream_id, target_issue):
+                if stream_id == "bad":
+                    raise OSError("单个目标炸了")
+                return await real_push_one(stream_id, target_issue)
+
+            plugin._push_one = flaky  # type: ignore[assignment]
+            with no_stagger():
+                failed = await plugin._push_batch(["bad", "good"], issue)
+            self.assertEqual(failed, ["bad"])
+            self.assertEqual(plugin._store.last_pushed_date("good"), "2026-10-19")
+            self.assertIsNone(plugin._store.last_pushed_date("bad"))
+
+        asyncio.run(scenario())
+
+    def test_round_failure_spawns_retry(self) -> None:
+        async def scenario() -> None:
+            plugin = build_plugin(self.tmp, send=FakeSend(fail_streams={"s1"}))
+            plugin._store.subscribe("s1", "10001")
+            issue = make_issue("2026-10-19")
+            proxy = _SleepProxy(plugin_module.asyncio)
+            with _patch(plugin_module, "asyncio", proxy), no_stagger():
+                await plugin._push_round(["s1"], issue)
+                self.assertEqual(len(plugin._tasks), 1)  # 后台重试任务已挂上
+                await asyncio.gather(*list(plugin._tasks), return_exceptions=True)
+            self.assertEqual(proxy.delays, [600, 600, 600])  # 3 轮重试
+            self.assertIsNone(plugin._store.last_pushed_date("s1"))
+
+        asyncio.run(scenario())
+
+
+class ConcurrencyTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp()
+
+    def test_same_target_inflight_deduplicated(self) -> None:
+        async def scenario() -> None:
+            plugin = build_plugin(self.tmp)
+            issue = make_long_issue("2026-10-19")
+            pages = plugin_module.paginate_issue(issue)
+            started = asyncio.Event()
+            release = asyncio.Event()
+            original = plugin._send_text
+
+            async def slow(text, stream_id):
+                started.set()
+                await release.wait()
+                return await original(text, stream_id)
+
+            plugin._send_text = slow  # type: ignore[assignment]
+            first = asyncio.create_task(plugin._push_one("s1", issue))
+            await asyncio.wait_for(started.wait(), timeout=2)
+            # 同一会话已有推送在飞时，第二个任务应立即返回，不重复发
+            self.assertTrue(await plugin._push_one("s1", issue))
+            release.set()
+            self.assertTrue(await first)
+            self.assertEqual(
+                [call for call in plugin.ctx.send.calls if call[0] == "s1"],
+                [(call[0], call[1]) for call in plugin.ctx.send.calls],
+            )
+            self.assertEqual(len(plugin.ctx.send.calls), len(pages))
+
+        asyncio.run(scenario())
+
+    def test_round_skips_when_locked(self) -> None:
+        async def scenario() -> None:
+            plugin = build_plugin(self.tmp)
+            plugin._store.subscribe("s1", "10001")
+            lock = asyncio.Lock()
+            await lock.acquire()
+            plugin._push_lock = lock
+            try:
+                await plugin._push_round(["s1"], make_issue("2026-10-19"))
+            finally:
+                lock.release()
+            self.assertEqual(plugin.ctx.send.calls, [])
+
+        asyncio.run(scenario())
+
+
+class StaticChatTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp()
+
+    def test_static_resolution_cooldown_and_recovery(self) -> None:
+        async def scenario() -> None:
+            chat = FakeChat({})
+            plugin = build_plugin(
+                self.tmp,
+                chat=chat,
+                subscribe={"static_chats": ["10001"]},
+            )
+            await plugin._ensure_static_chats()
+            self.assertEqual(chat.queries, [("10001", "qq")])
+            self.assertGreater(plugin._static_retry_at, plugin_module.time.monotonic())
+
+            # 冷却期内不再打 RPC
+            await plugin._ensure_static_chats()
+            self.assertEqual(chat.queries, [("10001", "qq")])
+
+            # 冷却结束且这次能解析到 stream，补上静态群
+            chat.streams["10001"] = {"stream_id": "static-1"}
+            plugin._static_retry_at = 0.0
+            await plugin._ensure_static_chats()
+            self.assertEqual(chat.queries, [("10001", "qq"), ("10001", "qq")])
+            self.assertEqual(plugin._static_stream_ids, {"10001": "static-1"})
+            self.assertIn("static-1", plugin._push_targets())
+
+        asyncio.run(scenario())
+
+
+class WaitIssueTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp()
+
+    def test_wait_publishes_when_today_arrives(self) -> None:
+        async def scenario() -> None:
+            plugin = build_plugin(self.tmp)
+            plugin._store.subscribe("s1", "10001")
+            calls = {"fetch": 0}
+
+            async def fake_fetch(force=False):
+                calls["fetch"] += 1
+                if calls["fetch"] == 1:
+                    return make_issue("2026-10-18")
+                return make_issue("2026-10-19")
+
+            plugin._fetcher.fetch_latest = fake_fetch  # type: ignore[assignment]
+            fixed = datetime(2026, 10, 19, 9, 0, tzinfo=timezone(timedelta(hours=8)))
+            proxy = _SleepProxy(plugin_module.asyncio)
+            with _patch(plugin_module, "now_cst", lambda: fixed), _patch(
+                plugin_module, "asyncio", proxy
+            ), no_stagger():
+                await plugin._wait_for_today_issue("2026-10-19", ["s1"])
+            self.assertEqual(proxy.delays, [plugin._WAIT_INTERVAL_SECONDS] * 2)
+            self.assertEqual(plugin._store.last_pushed_date("s1"), "2026-10-19")
+            self.assertTrue(plugin.ctx.send.calls)
+
+        asyncio.run(scenario())
+
+
+class ManualFetchTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp()
+
+    def test_cooldown_per_session(self) -> None:
+        async def scenario() -> None:
+            plugin = build_plugin(self.tmp)
+            issue = make_issue(plugin_module.today_cst())
+            calls = {"fetch": 0}
+
+            async def fake_fetch(force=False):
+                calls["fetch"] += 1
+                return issue
+
+            plugin._fetcher.fetch_latest = fake_fetch  # type: ignore[assignment]
+            with _patch(plugin_module, "time", _FakeTime([0.0, 30.0, 61.0])):
+                first = await plugin.cmd_daily(stream_id="s1")
+                second = await plugin.cmd_daily(stream_id="s1")
+                third = await plugin.cmd_daily(stream_id="s1")
+            self.assertEqual(first[1], "ok")
+            self.assertEqual(second[1], "throttled")
+            self.assertEqual(third[1], "ok")
+            self.assertEqual(calls["fetch"], 2)
+
+        asyncio.run(scenario())
+
+    def test_concurrent_manual_fetch_is_shared(self) -> None:
+        async def scenario() -> None:
+            plugin = build_plugin(self.tmp)
+            issue = make_issue(plugin_module.today_cst())
+            calls = {"fetch": 0}
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def slow_fetch(force=False):
+                calls["fetch"] += 1
+                started.set()
+                await release.wait()
+                return issue
+
+            plugin._fetcher.fetch_latest = slow_fetch  # type: ignore[assignment]
+            first = asyncio.create_task(plugin.cmd_daily(stream_id="s1"))
+            await asyncio.wait_for(started.wait(), timeout=2)
+            second = asyncio.create_task(plugin.cmd_daily(stream_id="s2"))
+            await asyncio.sleep(0)  # 让第二个请求挂到共享 task
+            release.set()
+            results = await asyncio.gather(first, second)
+            self.assertEqual(calls["fetch"], 1)
+            self.assertTrue(all(result[0] for result in results))
+
+        asyncio.run(scenario())
+
+
+class AdminSignalTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp()
+
+    def test_any_signal_grants_admin(self) -> None:
+        plugin = build_plugin(self.tmp, subscribe={"admin_only": True})
+        self.assertTrue(
+            plugin._check_admin(
+                {"message": {"is_admin": False}, "sender": {"role": "admin"}}
+            )
+        )
+        self.assertTrue(plugin._check_admin({"message": {"is_admin": True}}))
+        self.assertFalse(
+            plugin._check_admin(
+                {"message": {"is_admin": False}, "sender": {"role": "member"}}
+            )
+        )
+        self.assertFalse(plugin._check_admin({}))
 
 
 if __name__ == "__main__":

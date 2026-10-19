@@ -43,7 +43,7 @@ MaiBot 插件：订阅 [橘鸦AI早报](https://daily.juya.uk/)，每天定时�
 
 ```toml
 [schedule]
-push_time = "09:30"        # 每日推送时间（部署机本地时区，HH:MM）
+push_time = "09:30"        # 每日推送时间（固定东八区 UTC+8，HH:MM）
 catch_up_on_start = true   # 启动时补发今天还没推的一期
 
 [subscribe]
@@ -56,6 +56,8 @@ max_items = 0              # 每期最多推几条，0 = 全部
 footer = "…"               # 脚注模板，支持 {link} {date} {title}
 retry_minutes = 10         # 推送失败重试间隔
 retry_times = 3            # 失败最大重试轮数
+stagger_min_seconds = 30   # 多群推送错峰下限（秒）
+stagger_max_seconds = 120  # 多群推送错峰上限（秒，须 ≥ 下限）
 stale_deadline = "12:00"   # 当天一期超过这个时间还没发布就放弃
 ```
 
@@ -63,10 +65,10 @@ stale_deadline = "12:00"   # 当天一期超过这个时间还没发布就放弃
 
 ## 设计要点
 
-- **订阅状态、每群最后推送日期、最近一期缓存** 均持久化在 `data/plugins/com.juya.daily/state.json`（原子写），防止重启后重复推送；自助订阅与静态订阅群共用同一份推送进度，静态群即使未订阅也会记录「已推过今天」。
+- **订阅状态、每群推送进度（日期 + 页 + 是否完成）、最近一期缓存** 均持久化在 `data/plugins/com.juya.daily/state.json`（v3 结构，原子写），防止重启后重复推送；自助订阅与静态订阅群共用同一份推送进度，静态群即使未订阅也会记录「已推过今天」，多页失败时只补失败页。
 - **无 SDK 定时组件**，插件用 asyncio 后台任务自建每日定时器；热重载（新建 Runner 进程）时任务随插件卸载而取消，状态由落盘保证。
 - **容错**：RSS/Atom 宽容解析 + HTML 兜底；日期优先从标题/正文抽取（pubDate 仅兜底）；推送失败按 `retry_minutes × retry_times` 重试；当天早报未发布时每 30 分钟重查，到 `stale_deadline` 放弃。
-- **风控友好**：启动补推与多群推送时各单位并发发起、各自随机延迟 30–120 秒，群多时总耗时取决于最慢一个。
+- **风控友好**：启动补推与多群推送并发发起，各目标随机错峰 30–120 秒（`stagger_min_seconds` / `stagger_max_seconds`），单目标重复触发会被进程内去重。
 - **分页发送**：整期内容按「条」打包成多条消息，单条不超过 1800 字，避免被 QQ 截断；末页带来源脚注。
 - **链接格式兼容**：站点早期用 `/issue-N/`、现改为 `/issues/YYYY-MM-DD/`，RSS 与 HTML 兜底两种都认。
 
@@ -75,7 +77,7 @@ stale_deadline = "12:00"   # 当天一期超过这个时间还没发布就放弃
 ```bash
 # 在 MaiBot 仓库的 plugins/ 目录下（或任意位置）跑：
 python3 -m py_compile plugins/juya-daily/*.py          # 语法检查
-python3 -m unittest discover -s tests -v               # 单元测试（91 项）
+python3 -m unittest discover -s tests -v               # 单元测试（145 项）
 JUYA_LIVE=1 python3 -m unittest tests.test_live_rss -v # 真实站点冒烟（默认跳过）
 ```
 
@@ -83,9 +85,13 @@ JUYA_LIVE=1 python3 -m unittest tests.test_live_rss -v # 真实站点冒烟（�
 
 ## 注意
 
-- `push_time` 按部署机本地时区计算；站点（东八区）一般在早上 8 点前后发布当天一期，默认 09:30 可避开空窗。
+- `push_time` 固定按东八区（UTC+8）计算，与部署机时区无关；站点一般在早上 8 点前后发布当天一期，默认 09:30 可避开空窗。
+- **降级会丢状态**：0.3.0 使用 v3 状态结构，降级回 0.2.x 会把它当未来版本备份并重置订阅；升级前请保留 `state.json`。
+- **单实例约束**：并发去重与轮级锁是进程内状态，同一 `data_dir` 只允许一个插件实例；多实例请分开数据目录。
 - 站点声明资讯由 AI 辅助生成、可能存在错误，推送脚注默认保留该提示与原文链接。
-- 若站点改版导致 RSS 解析异常，可用上面的 `JUYA_LIVE=1` 冒烟最早发现；CI 每晚也会自动跑一次。
+- 已在 MaiBot 1.3.x + 插件 SDK 2.14 上验证；manifest 允许的更高版本未逐一实测。
+- 若站点改版导致 RSS 解析异常，可用上面的 `JUYA_LIVE=1` 冒烟最早发现；CI 每晚也会自动跑一次，失败会自动开 issue。
+- 安全边界：RSS/HTML 来自站点，默认信任 `daily.juya.uk`；XML 用标准库解析，单次响应读取上限 10 MiB。
 
 ## License
 

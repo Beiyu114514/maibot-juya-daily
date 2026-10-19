@@ -7,6 +7,25 @@ import logging
 from datetime import datetime, timedelta
 from typing import Callable
 
+DEFAULT_PUSH_TIME = (9, 30)
+
+
+def parse_hhmm(
+    value: str,
+    fallback: tuple[int, int] = DEFAULT_PUSH_TIME,
+    logger: logging.Logger | None = None,
+) -> tuple[int, int]:
+    """解析 HH:MM；非法值记一条 warning 并回退到 ``fallback``。"""
+    try:
+        hour, minute = (int(part) for part in str(value).split(":", 1))
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return hour, minute
+    except (ValueError, IndexError):
+        pass
+    if logger is not None:
+        logger.warning("时间配置非法: %r，回退 %02d:%02d", value, fallback[0], fallback[1])
+    return fallback
+
 
 class DailyScheduler:
     """每天在 push_time 触发一次 on_fire；stop() 可随时取消。
@@ -14,6 +33,9 @@ class DailyScheduler:
     ``now_fn`` 决定「现在几点」的参照系：默认宿主机本地时间，
     插件传入东八区时钟，与站点发布时间、today_cst() 保持一致。
     """
+
+    # 触发后睡过当前分钟，避免同一分钟重复触发；测试可覆写成小值。
+    POST_FIRE_SLEEP = 61.0
 
     def __init__(
         self,
@@ -61,14 +83,7 @@ class DailyScheduler:
     # ---------- 内部实现 ----------
 
     def _parse_push_time(self) -> tuple[int, int]:
-        try:
-            hour, minute = (int(part) for part in str(self.push_time).split(":", 1))
-            if 0 <= hour <= 23 and 0 <= minute <= 59:
-                return hour, minute
-        except (ValueError, IndexError):
-            pass
-        self.logger.warning("push_time 配置非法: %r，回退 09:30", self.push_time)
-        return 9, 30
+        return parse_hhmm(self.push_time, DEFAULT_PUSH_TIME, self.logger)
 
     def _next_run(self, now: datetime | None = None) -> datetime:
         hour, minute = self._parse_push_time()
@@ -103,4 +118,4 @@ class DailyScheduler:
                 raise
             except Exception:
                 self.logger.exception("每日推送回调执行出错")
-            await asyncio.sleep(61)  # 越过当前分钟，避免同一分钟重复触发
+            await asyncio.sleep(self.POST_FIRE_SLEEP)  # 越过当前分钟，避免同一分钟重复触发

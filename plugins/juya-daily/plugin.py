@@ -14,14 +14,15 @@
 import asyncio
 import os
 import random
+import time
 from datetime import time as dtime
 
 from pydantic import Field
 
 try:  # 以包形式加载（plugins.juya_daily.plugin）
     from .fetcher import Issue, JuyaFetcher, now_cst, today_cst
-    from .formatter import DEFAULT_FOOTER, format_issue, paginate_issue
-    from .scheduler import DailyScheduler
+    from .formatter import DEFAULT_FOOTER, paginate_issue
+    from .scheduler import DailyScheduler, parse_hhmm
     from .store import Store
 except ImportError:  # 以目录形式直接加载时的兜底
     import sys as _sys
@@ -31,8 +32,8 @@ except ImportError:  # 以目录形式直接加载时的兜底
     if _HERE not in _sys.path:
         _sys.path.insert(0, _HERE)
     from fetcher import Issue, JuyaFetcher, now_cst, today_cst
-    from formatter import DEFAULT_FOOTER, format_issue, paginate_issue
-    from scheduler import DailyScheduler
+    from formatter import DEFAULT_FOOTER, paginate_issue
+    from scheduler import DailyScheduler, parse_hhmm
     from store import Store
 
 try:
@@ -117,6 +118,16 @@ class PushSection(PluginConfigBase):
         description="推送脚注模板，支持 {link} {date} {title} 占位",
         json_schema_extra={"label": "脚注模板"},
     )
+    stagger_min_seconds: int = Field(
+        30,
+        description="每个目标随机错峰的最小延迟（秒），仅对同一批的第 2 个及以后目标生效",
+        json_schema_extra={"label": "错峰最小秒数"},
+    )
+    stagger_max_seconds: int = Field(
+        120,
+        description="每个目标随机错峰的最大延迟（秒）",
+        json_schema_extra={"label": "错峰最大秒数"},
+    )
     retry_minutes: int = Field(
         10,
         description="推送失败后的重试间隔（分钟）",
@@ -150,12 +161,21 @@ class JuyaDailyPlugin(MaiBotPlugin):
     config_model = JuyaDailyConfig
 
     _WAIT_INTERVAL_SECONDS = 30 * 60  # 今天的早报没发布时，隔多久再查一次
+    _PUSH_CONCURRENCY = 8  # 同时在飞的发送数上限，防止瞬时打爆平台
+    _MANUAL_COOLDOWN = 60.0  # /早报 同一会话的抓取冷却（秒）
+    _STATIC_RETRY_SECONDS = 300  # 静态群解析失败后的重试冷却
+    _ADMIN_ROLES = {"admin", "owner", "superuser", "administrator"}
 
     # ---------- 生命周期 ----------
 
     async def on_load(self) -> None:
         self._tasks: set[asyncio.Task] = set()
         self._static_stream_ids: dict[str, str] = {}
+        self._static_retry_at = 0.0
+        self._pushing: set[str] = set()
+        self._push_lock = asyncio.Lock()
+        self._manual_fetch_at: dict[str, float] = {}
+        self._fetch_task: asyncio.Task | None = None
 
         paths = getattr(self.ctx, "paths", None)
         data_dir = getattr(paths, "data_dir", None) if paths is not None else None
@@ -168,7 +188,7 @@ class JuyaDailyPlugin(MaiBotPlugin):
             )
         os.makedirs(data_dir, exist_ok=True)
 
-        self._store = Store(os.path.join(data_dir, "state.json"))
+        self._store = Store(os.path.join(data_dir, "state.json"), logger=self.ctx.logger)
         self._fetcher = JuyaFetcher(self.ctx.logger, cache=self._store.get_last_fetch())
 
         await self._resolve_static_chats()
@@ -198,6 +218,10 @@ class JuyaDailyPlugin(MaiBotPlugin):
         tasks = list(getattr(self, "_tasks", set()))
         for task in tasks:
             task.cancel()
+        fetch_task = getattr(self, "_fetch_task", None)
+        if fetch_task is not None and not fetch_task.done():
+            fetch_task.cancel()
+            tasks.append(fetch_task)
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self.ctx.logger.info("橘鸦AI早报插件已卸载")
@@ -208,6 +232,7 @@ class JuyaDailyPlugin(MaiBotPlugin):
         try:
             old_scheduler = getattr(self, "_scheduler", None)
             old_time = getattr(old_scheduler, "push_time", None)
+            self._static_retry_at = 0.0
             await self._resolve_static_chats()
             new_time = self.config.schedule.push_time
             if old_time != new_time:
@@ -226,11 +251,20 @@ class JuyaDailyPlugin(MaiBotPlugin):
 
     # ---------- 命令 ----------
 
-    @Command("juya_daily", pattern=r"^/早报(?!订阅|退订|状态)")
+    @Command("juya_daily", description="即时拉取并发送最新一期早报", pattern=r"^/早报(?!订阅|退订|状态)")
     async def cmd_daily(self, **kwargs):
         """即时拉取最新一期早报。"""
+        stream_id = str(kwargs.get("stream_id") or kwargs.get("session_id") or "")
+        now = time.monotonic()
+        fetch_times = self.__dict__.setdefault("_manual_fetch_at", {})
+        previous = fetch_times.get(stream_id)
+        if stream_id and previous is not None and now - previous < self._MANUAL_COOLDOWN:
+            await self._reply(kwargs, "刚拉过一次，稍等一分钟再试~")
+            return (True, "throttled", 2)
+        if stream_id:
+            fetch_times[stream_id] = now
         try:
-            issue = await self._fetcher.fetch_latest()
+            issue = await self._fetch_latest_shared()
         except Exception as exc:
             self.ctx.logger.exception("/早报 拉取失败")
             await self._reply(kwargs, f"拉取早报出错了：{exc}")
@@ -246,15 +280,14 @@ class JuyaDailyPlugin(MaiBotPlugin):
             footer_template=self.config.push.footer or DEFAULT_FOOTER,
             stale=stale,
         )
-        stream_id = kwargs.get("stream_id") or kwargs.get("session_id")
         if stream_id:
             for page in pages:
-                await self._send_text(page, str(stream_id))
+                await self._send_text(page, stream_id)
         else:
             self.ctx.logger.warning("/早报 缺少 stream_id，只能记录日志：%s", pages[0][:80])
         return (True, "ok", 2)
 
-    @Command("juya_daily_sub", pattern=r"^/早报订阅")
+    @Command("juya_daily_sub", description="订阅每日早报推送", pattern=r"^/早报订阅")
     async def cmd_subscribe(self, **kwargs):
         if not self._check_admin(kwargs):
             await self._reply(kwargs, "当前配置为仅管理员可订阅，请联系 bot 管理员")
@@ -270,7 +303,7 @@ class JuyaDailyPlugin(MaiBotPlugin):
             await self._reply(kwargs, "这个会话已经订阅过啦～")
         return (True, "ok", 2)
 
-    @Command("juya_daily_unsub", pattern=r"^/早报退订")
+    @Command("juya_daily_unsub", description="退订每日早报推送", pattern=r"^/早报退订")
     async def cmd_unsubscribe(self, **kwargs):
         if not self._check_admin(kwargs):
             await self._reply(kwargs, "当前配置为仅管理员可退订，请联系 bot 管理员")
@@ -285,7 +318,7 @@ class JuyaDailyPlugin(MaiBotPlugin):
             await self._reply(kwargs, "这个会话本来就没订阅哦")
         return (True, "ok", 2)
 
-    @Command("juya_daily_status", pattern=r"^/早报状态")
+    @Command("juya_daily_status", description="查看本会话订阅状态与下次推送时间", pattern=r"^/早报状态")
     async def cmd_status(self, **kwargs):
         stream_id = str(kwargs.get("stream_id") or kwargs.get("session_id") or "")
         subs = self._store.subscriptions()
@@ -296,7 +329,7 @@ class JuyaDailyPlugin(MaiBotPlugin):
             "🛰️ 橘鸦AI早报 · 状态",
             f"本会话订阅：{'是' if stream_id and stream_id in subs else '否'}",
             f"总订阅数：{len(subs)}（另含静态群 {len(self._static_stream_ids)} 个）",
-            f"推送时间：每天 {self.config.schedule.push_time}",
+            f"推送时间：每天 {self.config.schedule.push_time}（东八区 UTC+8）",
         ]
         if next_run:
             lines.append(f"下次推送：{next_run.strftime('%m-%d %H:%M')}")
@@ -310,8 +343,30 @@ class JuyaDailyPlugin(MaiBotPlugin):
     def _spawn(self, coro, name: str) -> asyncio.Task:
         task = asyncio.create_task(coro, name=f"juya-{name}")
         self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+
+        def _done(finished: asyncio.Task) -> None:
+            self._tasks.discard(finished)
+            if finished.cancelled():
+                return
+            exc = finished.exception()
+            if exc is not None:
+                self.ctx.logger.error(
+                    "后台任务 %s 异常退出: %r", finished.get_name(), exc, exc_info=exc
+                )
+
+        task.add_done_callback(_done)
         return task
+
+    async def _fetch_latest_shared(self):
+        """合并同一时刻的抓取请求：并发 /早报 只打一次站点。"""
+        task = getattr(self, "_fetch_task", None)
+        if task is None or task.done():
+            task = asyncio.create_task(self._fetcher.fetch_latest())
+            # 若所有等待者都被取消，避免 "Task exception was never retrieved"
+            task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+            self._fetch_task = task
+        # shield：某个命令被取消时，不连带取消其他会话共享的抓取
+        return await asyncio.shield(task)
 
     async def _reply(self, kwargs: dict, text: str) -> None:
         stream_id = kwargs.get("stream_id") or kwargs.get("session_id")
@@ -362,21 +417,31 @@ class JuyaDailyPlugin(MaiBotPlugin):
     def _check_admin(self, kwargs: dict) -> bool:
         if not self.config.subscribe.admin_only:
             return True
-        # 适配器字段不统一，尽量兼容；判定不了就拒绝，避免越权
-        for key in ("is_admin", "is_superuser", "is_bot_admin"):
-            if key in kwargs:
-                return bool(kwargs[key])
-        for holder_key in ("message", "sender", "user"):
-            holder = kwargs.get(holder_key)
+        # 适配器字段不统一：合并所有信号，任一为真即放行。
+        # 不能用「首个命中即返回」——Host 可能在 message 里恒塞 is_admin=False，
+        # 而真正的管理员标记在 sender.role。
+        signals: list[bool] = []
+        holders = [
+            kwargs,
+            kwargs.get("message"),
+            kwargs.get("sender"),
+            kwargs.get("user"),
+            kwargs.get("member"),
+        ]
+        for holder in holders:
             if not isinstance(holder, dict):
                 continue
-            for key in ("is_admin", "is_superuser"):
+            for key in ("is_admin", "is_superuser", "is_bot_admin"):
                 if key in holder:
-                    return bool(holder[key])
+                    signals.append(bool(holder[key]))
             role = holder.get("role")
-            if role:
-                return str(role).lower() in ("admin", "owner", "superuser", "administrator")
-        self.ctx.logger.warning("admin_only=true 且无法判定发送者身份，已拒绝订阅操作")
+            if role is not None:
+                signals.append(str(role).strip().lower() in self._ADMIN_ROLES)
+        if any(signals):
+            return True  # 任一信号为真即放行
+        if signals:
+            return False
+        self.ctx.logger.warning("无法判定管理员身份（缺少 is_admin/role 字段），按非管理员处理")
         return False
 
     # ---------- 订阅与推送 ----------
@@ -403,6 +468,17 @@ class JuyaDailyPlugin(MaiBotPlugin):
                 self._static_stream_ids[group_id] = stream_id
             else:
                 self.ctx.logger.warning("找不到群 %s(%s) 的会话流，跳过该静态订阅", group_id, platform)
+
+    async def _ensure_static_chats(self) -> None:
+        """推送前惰性补解析静态群；失败后 5 分钟内不再重试，避免每次推送打 RPC。"""
+        if self._static_stream_ids or not (self.config.subscribe.static_chats or []):
+            return
+        now = time.monotonic()
+        if now < getattr(self, "_static_retry_at", 0.0):
+            return
+        await self._resolve_static_chats()
+        if not self._static_stream_ids:
+            self._static_retry_at = now + self._STATIC_RETRY_SECONDS
 
     def _push_targets(self) -> list[str]:
         targets = list(self._store.subscriptions().keys())
@@ -433,33 +509,80 @@ class JuyaDailyPlugin(MaiBotPlugin):
         return bool(result)
 
     async def _push_one(self, stream_id: str, issue: Issue) -> bool:
-        """推送一期早报（自动分页）；全部页发送成功才算成功。"""
-        pages = paginate_issue(
-            issue,
-            max_items=int(self.config.push.max_items or 0),
-            footer_template=self.config.push.footer or DEFAULT_FOOTER,
+        """推送一期早报（自动分页）；按页记录进度，失败后从断点续传。"""
+        pushing = self.__dict__.setdefault("_pushing", set())
+        if stream_id in pushing:
+            self.ctx.logger.info("%s 已有推送在飞，跳过重复任务", stream_id)
+            return True
+        pushing.add(stream_id)
+        try:
+            state = self._store.push_state(stream_id)
+            if state["date"] == issue.date and state["done"]:
+                return True
+            pages = paginate_issue(
+                issue,
+                max_items=int(self.config.push.max_items or 0),
+                footer_template=self.config.push.footer or DEFAULT_FOOTER,
+            )
+            start = state["page"] if state["date"] == issue.date else 0
+            if start >= len(pages):
+                start = 0  # 内容改版后页数变少，从头再发
+            for index in range(start, len(pages)):
+                if not await self._send_text(pages[index], stream_id):
+                    if index > 0:
+                        self.ctx.logger.warning(
+                            "推送到 %s 的第 %d/%d 页失败，已发出的页无法撤回，重试将从该页继续",
+                            stream_id,
+                            index + 1,
+                            len(pages),
+                        )
+                    return False  # 进度停在 index
+                self._store.set_push_progress(
+                    stream_id,
+                    issue.date,
+                    page=index + 1,
+                    done=(index + 1 == len(pages)),
+                )
+            return True
+        finally:
+            pushing.discard(stream_id)
+
+    async def _push_batch(self, stream_ids: list[str], issue: Issue) -> list[str]:
+        """并发推送一批目标；非首个目标在 [stagger_min, stagger_max] 秒内随机延迟。"""
+        sem = asyncio.Semaphore(self._PUSH_CONCURRENCY)
+        low = max(0, int(self.config.push.stagger_min_seconds or 0))
+        high = max(low, int(self.config.push.stagger_max_seconds or low))
+        static_values = set(self._static_stream_ids.values())
+
+        async def run(index: int, stream_id: str) -> bool:
+            if index:
+                await asyncio.sleep(random.uniform(low, high))
+            if not self._store.is_subscribed(stream_id) and stream_id not in static_values:
+                return True  # 推送间隙被退订
+            async with sem:
+                return await self._push_one(stream_id, issue)
+
+        results = await asyncio.gather(
+            *(run(index, sid) for index, sid in enumerate(stream_ids)),
+            return_exceptions=True,
         )
-        for index, page in enumerate(pages, start=1):
-            if not await self._send_text(page, stream_id):
-                if index > 1:
-                    self.ctx.logger.warning(
-                        "推送到 %s 的第 %d/%d 页失败，前面已发出的页无法撤回",
-                        stream_id,
-                        index,
-                        len(pages),
-                    )
-                return False
-        self._store.set_last_pushed(stream_id, issue.date)
-        return True
+        failed: list[str] = []
+        for sid, result in zip(stream_ids, results):
+            if isinstance(result, BaseException):
+                self.ctx.logger.error("推送 %s 异常: %r", sid, result)
+                failed.append(sid)
+            elif result is not True:
+                failed.append(sid)
+        return failed
 
     async def _push_round(self, due: list[str], issue: Issue) -> None:
-        static_values = set(self._static_stream_ids.values())
-        failed: list[str] = []
-        for stream_id in due:
-            if not self._store.is_subscribed(stream_id) and stream_id not in static_values:
-                continue  # 推送间隙被退订了
-            if not await self._push_one(stream_id, issue):
-                failed.append(stream_id)
+        lock = self.__dict__.setdefault("_push_lock", asyncio.Lock())
+        if lock.locked():
+            self.ctx.logger.info("已有推送轮在进行，跳过本轮")
+            return
+        # 检查与 acquire 之间没有 await，单线程事件循环下是原子的
+        async with lock:
+            failed = await self._push_batch(due, issue)
         if failed:
             self.ctx.logger.warning("%d 个会话推送失败，稍后重试", len(failed))
             self._spawn(self._retry_failed(failed, issue), "push-retry")
@@ -485,6 +608,7 @@ class JuyaDailyPlugin(MaiBotPlugin):
             return
         try:
             await asyncio.sleep(random.uniform(5, 15))  # 等连接稳定
+            await self._ensure_static_chats()
             today = today_cst()
             due = [
                 stream_id
@@ -498,18 +622,7 @@ class JuyaDailyPlugin(MaiBotPlugin):
                 self.ctx.logger.info("启动补推：今天(%s)的一期还没抓到，等每日定时再推", today)
                 return
             self.ctx.logger.info("启动补推：%d 个会话今天还没收到，错峰发送", len(due))
-
-            async def _push_staggered(stream_id: str, index: int) -> bool:
-                if index:
-                    # 并发发起但各自随机延迟，群多时总耗时取决于最慢一个而非总和
-                    await asyncio.sleep(random.uniform(30, 120))
-                return await self._push_one(stream_id, issue)
-
-            results = await asyncio.gather(
-                *(_push_staggered(stream_id, index) for index, stream_id in enumerate(due)),
-                return_exceptions=True,
-            )
-            failed = [sid for sid, result in zip(due, results) if result is not True]
+            failed = await self._push_batch(due, issue)
             if failed:
                 self.ctx.logger.warning("启动补推 %d 个会话失败: %s", len(failed), ", ".join(failed))
                 self._spawn(self._retry_failed(failed, issue), "catch-up-retry")
@@ -518,17 +631,8 @@ class JuyaDailyPlugin(MaiBotPlugin):
         except Exception:
             self.ctx.logger.exception("启动补推失败")
 
-    @staticmethod
-    def _parse_hhmm(value: str, fallback: tuple[int, int]) -> tuple[int, int]:
-        try:
-            hour, minute = (int(part) for part in str(value).split(":", 1))
-            if 0 <= hour <= 23 and 0 <= minute <= 59:
-                return hour, minute
-        except (ValueError, IndexError):
-            pass
-        return fallback
-
     async def _on_schedule_fire(self) -> None:
+        await self._ensure_static_chats()
         today = today_cst()
         due = [
             stream_id
@@ -547,7 +651,9 @@ class JuyaDailyPlugin(MaiBotPlugin):
         self._spawn(self._wait_for_today_issue(today, due), "wait-today-issue")
 
     async def _wait_for_today_issue(self, today: str, due: list[str]) -> None:
-        hour, minute = self._parse_hhmm(self.config.push.stale_deadline, (12, 0))
+        hour, minute = parse_hhmm(
+            self.config.push.stale_deadline, (12, 0), self.ctx.logger
+        )
         deadline = dtime(hour, minute)
 
         def _now_cst_time() -> dtime:

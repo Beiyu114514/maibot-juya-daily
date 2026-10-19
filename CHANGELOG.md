@@ -2,6 +2,58 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.0] - 2026-10-19
+
+### 新增
+
+- **并发推送 + 可配置错峰**：多目标用 `asyncio.Semaphore(8)` 并发发起，非首个目标随机等待 `stagger_min_seconds`～`stagger_max_seconds`（默认 30–120 秒），20 个群不再串行线性累加
+- **多页断点续传（state v3）**：每群推送进度记录为 `{date, page, done}`，中途失败后重试只补剩余页；旧版 v2 的日期字符串会自动迁移为 `done=true`，v1 仍可迁移
+- **并发去重**：进程内 `_pushing` 集合 + 轮级 `_push_lock`，同一目标同时只有一条推送在飞；发送前复查 done，避免定时任务与手动 `/早报` 撞车重复发
+- **`/早报` 冷却与共享抓取**：每会话 60 秒冷却，并发请求共享同一个抓取 task，避免连点触发多次 RSS 请求与重复刷屏
+- **静态群惰性补解析**：启动时解析失败的 `static_chats` 在后续定时/手动推送前重试，失败冷却 300 秒
+
+### 修复
+
+- **`_spawn` 吞掉后台任务异常**：done 回调现在取出异常并 `logger.error`，重试/补推任务崩溃不再无声无息
+- **管理员判定只认第一个信号**：`_check_admin` 合并 `message.is_admin`、`sender.role`、`role` 等多个信号，任一为真即放行
+- **状态文件写盘瞬时错误被当损坏重置**：`OSError` 现在保留原文件并记 warning，只有 JSON 解析失败才备份 `.corrupt`；未来版本备份为 `.future`，日志明确提示
+- **`get_last_fetch()` 返回内部可变字典**：改为深拷贝，避免 fetcher 原地修改绕过 `save()`
+- **超大响应无上限**：RSS/HTML 单次读取上限 10 MiB，超限抛 `ResponseTooLarge` 并立即失败，不再重试
+
+### 改进
+
+- 4 条命令补齐 `description`，WebUI/帮助列表不再显示空白
+- `_parse_hhmm` 收敛到 `scheduler.parse_hhmm`，插件与定时器共用一套回退逻辑
+- `USER_AGENT` 跟随 `_manifest.json` 版本，站点侧版本统计不再停留在 0.1
+- 文档统一为「`push_time` 固定东八区（UTC+8）」，补充降级丢状态、信任边界与实测版本说明
+
+### 工程化
+
+- CI 最小权限（默认只读、package 单独 `contents: write`）、`concurrency` 取消重复运行、job 超时 10 分钟
+- 新增 `ruff check --select E9,F63,F7,F82` 与 `coverage report --fail-under=80` 门禁
+- 打包前断言 `v$manifest_version == $GITHUB_REF_NAME`，防止 tag 与 manifest 版本不一致
+- 夜间真实站点冒烟失败时自动 `gh issue create`，不再永远绿色
+- 依赖加上界（`pydantic<3`、`maibot-plugin-sdk>=2.14,<3`），`.gitignore` 忽略本地 `config.toml`
+- 测试从 110 项增至 145 项：新增 scheduler 循环、fetcher HTML 兜底/缓存/体积上限、store v2/v3 迁移与容错、断点续传、并发去重、冷却、静态群恢复、`_wait_for_today_issue` 成功路径、`_push_round` 失败分支
+
+### 升级注意
+
+- 状态自动从 v1/v2 迁移到 v3；**降级回 0.2.x 会把 v3 状态当未来版本备份并重置订阅**，升级前请保留 `state.json`
+- 去重与轮级锁是进程内状态：同一 `data_dir` 只允许一个 MaiBot 实例，多实例请分开数据目录
+
+## [0.2.1] - 2026-10-19
+
+### 修复
+
+- **`max_items` 把导语算成第 1 条**：新增 `split_issue()` 把导语与编号条目分开，限条数只作用于条目；`split_items()` 保留旧签名（导语仍在首位）兼容调用方
+- **分页用 `text[:1800]` 硬截断导致丢正文、丢脚注**：改为 `_pack_pages()` 预装页并预留页码预算，正文与脚注永不截断；超长标题只截标题本身，脚注全页合计恰好出现 1 次
+- **概览与分组小标题残留**（如「概览」「要闻」「技术与洞察」）：`_strip_noise()` 改为两轮「先分组标题、再概览行」，并剥掉重复的站点标题行；短正文行/短链接不会被误删
+
+### 改进
+
+- 删除死代码 `format_issue()`（`plugin.py` 只导入未使用），渲染入口收敛为 `paginate_issue()`
+- 新增真实一期 fixture（`tests/fixtures/rss_2026-10-19.txt`）与分页不变量测试，另加固定种子 200 例 fuzz（`tests/test_formatter_fuzz.py`）
+
 ## [0.2.0] - 2026-10-19
 
 ### 新增
@@ -43,6 +95,8 @@
 - `ctx.paths.data_dir` 不可用时打 warning 日志
 - `_manifest.json`：作者改为 Beiyu114514，仓库地址指向 GitHub
 
+[0.3.0]: https://github.com/Beiyu114514/maibot-juya-daily/releases/tag/v0.3.0
+[0.2.1]: https://github.com/Beiyu114514/maibot-juya-daily/releases/tag/v0.2.1
 [0.1.1]: https://github.com/Beiyu114514/maibot-juya-daily/releases/tag/v0.1.1
 [0.2.0]: https://github.com/Beiyu114514/maibot-juya-daily/releases/tag/v0.2.0
 
