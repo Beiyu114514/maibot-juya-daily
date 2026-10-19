@@ -371,6 +371,22 @@ def markdown_to_plain(text: str) -> str:
 # ---------- 长图渲染（交给宿主 render.html2png 截图） ----------
 
 IMAGE_CARD_WIDTH = 760
+# 长图正文字号（CSS 像素）。长图在手机端会被等比缩小（760px 宽约缩到 390px，
+# 只剩一半左右），默认值比早期硬编码的 15px 略大，觉得小可在配置里调到 22–30。
+IMAGE_FONT_SIZE = 18
+IMAGE_FONT_SIZE_MIN = 12
+IMAGE_FONT_SIZE_MAX = 40
+# 各元素相对正文的字号比例，保证调大字号后版式比例不变
+_IMAGE_FONT_RATIOS = {
+    "brand": 13 / 15,
+    "h1": 29 / 15,
+    "date": 13 / 15,
+    "notice": 13.5 / 15,
+    "intro": 1.0,
+    "item_title": 18.5 / 15,
+    "item_body": 1.0,
+    "footer": 12.5 / 15,
+}
 _IMAGE_FONT_STACK = (
     '"Noto Sans CJK SC","Source Han Sans SC","PingFang SC","Microsoft YaHei",'
     '"WenQuanYi Micro Hei",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif'
@@ -380,21 +396,43 @@ _IMAGE_CSS = """
 *{box-sizing:border-box;}
 html,body{margin:0;padding:0;background:#eef1f7;scrollbar-width:none;-ms-overflow-style:none;}
 body::-webkit-scrollbar{display:none;width:0;height:0;}
-body{width:__WIDTH__px;font-family:__FONT__;color:#1b2330;-webkit-font-smoothing:antialiased;}
+body{width:__WIDTH__px;font-family:__FONT__;font-size:__BODY__px;color:#1b2330;-webkit-font-smoothing:antialiased;}
 .card{width:__WIDTH__px;padding:26px 24px 24px;background:linear-gradient(180deg,#eef3fc 0%,#e9eef8 100%);}
 .panel{background:#fff;border-radius:22px;padding:34px 32px 28px;box-shadow:0 12px 30px rgba(23,43,77,.08);}
-.brand{display:flex;align-items:center;gap:9px;font-size:13px;letter-spacing:.14em;color:#64749a;text-transform:uppercase;}
+.brand{display:flex;align-items:center;gap:9px;font-size:__BRAND__px;letter-spacing:.14em;color:#64749a;text-transform:uppercase;}
 .dot{width:9px;height:9px;border-radius:50%;background:#4f7cff;box-shadow:0 0 0 4px rgba(79,124,255,.14);}
-h1{font-size:29px;line-height:1.4;font-weight:800;letter-spacing:-.01em;margin:14px 0 8px;color:#101b31;overflow-wrap:anywhere;}
-.date{font-size:13px;color:#8492a8;margin:0 0 22px;}
-.notice{font-size:13.5px;line-height:1.75;color:#8a5b12;background:#fff7e6;border:1px solid #ffe3ad;border-radius:12px;padding:10px 14px;margin:0 0 18px;white-space:pre-wrap;}
-.intro{font-size:15px;line-height:1.85;color:#39445a;background:#f5f8ff;border-left:4px solid #4f7cff;border-radius:0 12px 12px 0;padding:14px 16px;margin:0 0 22px;white-space:pre-wrap;overflow-wrap:anywhere;}
+h1{font-size:__H1__px;line-height:1.4;font-weight:800;letter-spacing:-.01em;margin:14px 0 8px;color:#101b31;overflow-wrap:anywhere;}
+.date{font-size:__DATE__px;color:#8492a8;margin:0 0 22px;}
+.notice{font-size:__NOTICE__px;line-height:1.75;color:#8a5b12;background:#fff7e6;border:1px solid #ffe3ad;border-radius:12px;padding:10px 14px;margin:0 0 18px;white-space:pre-wrap;}
+.intro{font-size:__INTRO__px;line-height:1.85;color:#39445a;background:#f5f8ff;border-left:4px solid #4f7cff;border-radius:0 12px 12px 0;padding:14px 16px;margin:0 0 22px;white-space:pre-wrap;overflow-wrap:anywhere;}
 .item{padding:20px 0;border-top:1px solid #edf0f6;}
 .item:first-of-type{border-top:none;padding-top:4px;}
-.item-title{font-size:18.5px;line-height:1.55;font-weight:700;color:#16233c;margin:0 0 10px;overflow-wrap:anywhere;}
-.item-body{font-size:15px;line-height:1.9;color:#33405a;white-space:pre-wrap;overflow-wrap:anywhere;}
-.footer{margin-top:26px;padding-top:18px;border-top:1px dashed #dfe5f0;font-size:12.5px;line-height:1.8;color:#8a94a6;white-space:pre-wrap;overflow-wrap:anywhere;}
+.item-title{font-size:__ITEM_TITLE__px;line-height:1.55;font-weight:700;color:#16233c;margin:0 0 10px;overflow-wrap:anywhere;}
+.item-body{font-size:__ITEM_BODY__px;line-height:1.9;color:#33405a;white-space:pre-wrap;overflow-wrap:anywhere;}
+.footer{margin-top:26px;padding-top:18px;border-top:1px dashed #dfe5f0;font-size:__FOOTER__px;line-height:1.8;color:#8a94a6;white-space:pre-wrap;overflow-wrap:anywhere;}
 """
+
+
+def _resolve_image_font_size(font_size: int | float | None) -> int:
+    """把配置字号夹到允许区间；空值/非法值回落到默认字号。"""
+    try:
+        value = int(round(float(font_size)))  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return IMAGE_FONT_SIZE
+    return max(IMAGE_FONT_SIZE_MIN, min(IMAGE_FONT_SIZE_MAX, value))
+
+
+def _scaled_font(base: int, ratio: float) -> str:
+    """按版式比例算出某个元素的字号，最多保留 1 位小数。"""
+    return f"{round(base * ratio, 1):g}"
+
+
+def _image_font_css(base: int) -> dict[str, str]:
+    """生成 CSS 里各字号占位符的替换值（含 body 的 __BODY__）。"""
+    values = {"BODY": f"{base:g}"}
+    for name, ratio in _IMAGE_FONT_RATIOS.items():
+        values[name.upper()] = _scaled_font(base, ratio)
+    return values
 
 
 def _html_block(text: str) -> str:
@@ -408,11 +446,14 @@ def render_issue_html(
     footer_template: str = DEFAULT_FOOTER,
     stale: bool = False,
     width: int = IMAGE_CARD_WIDTH,
+    font_size: int = IMAGE_FONT_SIZE,
 ) -> str:
     """把一期渲染成自包含 HTML，供宿主 ``render.html2png`` 截成长图。
 
     HTML 不引用任何外部资源（字体走系统字体栈，无图片/脚本），
     因此宿主浏览器不需要联网也能渲染；返回整页供 ``full_page`` 截图。
+    ``font_size`` 是正文 CSS 字号，标题/脚注等按版式比例同步缩放；
+    超出 ``IMAGE_FONT_SIZE_MIN``–``IMAGE_FONT_SIZE_MAX`` 时自动夹取。
     """
     title, intro, items, note, footer = _prepare_issue(issue, max_items, footer_template)
 
@@ -453,6 +494,8 @@ def render_issue_html(
         _IMAGE_CSS.replace("__WIDTH__", str(int(width)))
         .replace("__FONT__", _IMAGE_FONT_STACK)
     )
+    for name, value in _image_font_css(_resolve_image_font_size(font_size)).items():
+        css = css.replace(f"__{name}__", value)
     return (
         "<!DOCTYPE html>\n"
         '<html lang="zh-CN"><head><meta charset="utf-8">'

@@ -63,11 +63,13 @@ message_format = "markdown"
 [push]
 message_format = "image"
 image_width = 760         # 长图宽度（CSS 像素）
+image_font_size = 18      # 正文字号（CSS 像素，12–40；手机端字小可调到 22–30）
 image_scale = 2.0         # 清晰度（设备像素比）
-image_max_height = 16000  # 像素高度上限，超过则回退纯文本
+image_max_height = 16000  # 像素高度上限（设备像素），超过则回退纯文本
 image_timeout_ms = 30000  # 渲染超时
 ```
 
+- 字号：`image_font_size`（默认 18）是正文 CSS 字号，标题/脚注按版式比例同步缩放。手机端会把 760px 宽的长图等比缩到约 390px（≈51%），默认仍偏小时可调到 22–30；字号越大图片越高，`image_max_height`（默认 16000 设备像素，2 倍图下约 8000 CSS 像素）会更早触发回退，若常用 28–30 可把它调到 20000–24000（代价是截图更大、发送更慢），或调小 `image_width`。
 - 需要宿主开启浏览器渲染：MaiBot 配置 `plugin_runtime.render.enabled = true`（默认开启），并确保 Playwright/Chromium 可用。
 - 渲染不可用、截图失败、图片发送失败或高度超限时，整期自动回退纯文本，不会让推送彻底失败；回退后按文本页记录进度，重试只补剩余页。
 - 长图模式按「整期一张」记录推送进度，失败重试会重发整张图；一旦已回退纯文本并发出部分页，重试会跳过长图渲染，只续发剩余文本页（不会每轮重新渲染并从第 1 页刷屏）。
@@ -88,8 +90,9 @@ admin_only = false         # 仅管理员可订阅/退订
 [push]
 message_format = "text"    # text=纯文本；markdown=QQ Markdown；image=长图
 image_width = 760          # 长图宽度（CSS 像素）
+image_font_size = 18       # 长图正文字号（px，12–40；手机端字小可调到 22–30）
 image_scale = 2.0          # 长图清晰度（设备像素比）
-image_max_height = 16000   # 长图像素高度上限，超过回退纯文本
+image_max_height = 16000   # 长图像素高度上限（设备像素），超过回退纯文本
 image_timeout_ms = 30000   # 长图渲染超时（毫秒）
 max_items = 0              # 每期最多推几条，0 = 全部
 footer = "…"               # 脚注模板，支持 {link} {date} {title}
@@ -116,7 +119,7 @@ stale_deadline = "12:00"   # 当天一期超过这个时间还没发布就放弃
 ```bash
 # 在 MaiBot 仓库的 plugins/ 目录下（或任意位置）跑：
 python3 -m py_compile plugins/juya-daily/*.py          # 语法检查
-python3 -m unittest discover -s tests -v               # 单元测试（187 项）
+python3 -m unittest discover -s tests -v               # 单元测试（191 项）
 JUYA_LIVE=1 python3 -m unittest tests.test_live_rss -v # 真实站点冒烟（默认跳过）
 ```
 
