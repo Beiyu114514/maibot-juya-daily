@@ -1,0 +1,29 @@
+[schedule]
+# 每日推送时间（部署机本地时区，HH:MM）
+push_time = "09:30"
+# 启动时若已过推送时间且今天还没推，自动补发今天一期
+catch_up_on_start = true
+
+[subscribe]
+# 静态订阅群列表（填群号，兜底用；与群内自助订阅叠加）
+static_chats = []
+static_platform = "qq"
+# 仅管理员可使用 /早报订阅 /早报退订
+admin_only = false
+
+[push]
+# 每期最多推送的资讯条数，0 表示全部
+max_items = 0
+# 脚注模板，支持 {link} {date} {title} 占位
+footer = """
+——
+📡 橘鸦AI早报（{date}）
+🔗 原文：{link}
+ℹ️ 资讯由 AI 辅助生成，可能存在错误，请以原文为准
+"""
+# 推送失败后的重试间隔（分钟）
+retry_minutes = 10
+# 当天推送失败的最大重试轮数
+retry_times = 3
+# 今天的早报到几点还没发布就放弃当天推送（HH:MM）
+stale_deadline = "12:00"
