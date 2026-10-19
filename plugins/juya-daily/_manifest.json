@@ -1,15 +1,17 @@
 {
   "manifest_version": 2,
   "id": "com.juya.daily",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "name": "橘鸦AI早报",
   "description": "订阅 https://daily.juya.uk/ 每日 AI 资讯早报：群内自助订阅，每天定时推送（纯文本），支持 /早报 即取即看与失败重试。",
   "author": {
-    "name": "MaiBot community"
+    "name": "Beiyu114514",
+    "url": "https://github.com/Beiyu114514"
   },
   "license": "MIT",
   "urls": {
-    "repository": "https://daily.juya.uk/"
+    "repository": "https://github.com/Beiyu114514/maibot-juya-daily",
+    "homepage": "https://daily.juya.uk/"
   },
   "host_application": {
     "min_version": "0.0.0",

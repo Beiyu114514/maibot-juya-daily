@@ -124,6 +124,11 @@ class JuyaDailyPlugin(MaiBotPlugin):
         data_dir = getattr(paths, "data_dir", None) if paths is not None else None
         if not data_dir:
             data_dir = os.path.join(os.getcwd(), "data", "juya-daily")
+            self.ctx.logger.warning(
+                "ctx.paths.data_dir 不可用，状态将写入 %s（cwd=%s，可能不符合预期）",
+                data_dir,
+                os.getcwd(),
+            )
         os.makedirs(data_dir, exist_ok=True)
 
         self._store = Store(os.path.join(data_dir, "state.json"))
@@ -423,10 +428,21 @@ class JuyaDailyPlugin(MaiBotPlugin):
                 self.ctx.logger.info("启动补推：今天(%s)的一期还没抓到，等每日定时再推", today)
                 return
             self.ctx.logger.info("启动补推：%d 个会话今天还没收到，错峰发送", len(due))
-            for index, stream_id in enumerate(due):
+
+            async def _push_staggered(stream_id: str, index: int) -> bool:
                 if index:
-                    await asyncio.sleep(random.uniform(30, 120))  # 群间错峰，避免刷屏/风控
-                await self._push_one(stream_id, issue)
+                    # 并发发起但各自随机延迟，群多时总耗时取决于最慢一个而非总和
+                    await asyncio.sleep(random.uniform(30, 120))
+                return await self._push_one(stream_id, issue)
+
+            results = await asyncio.gather(
+                *(_push_staggered(stream_id, index) for index, stream_id in enumerate(due)),
+                return_exceptions=True,
+            )
+            failed = [sid for sid, result in zip(due, results) if result is not True]
+            if failed:
+                self.ctx.logger.warning("启动补推 %d 个会话失败: %s", len(failed), ", ".join(failed))
+                self._spawn(self._retry_failed(failed, issue), "catch-up-retry")
         except asyncio.CancelledError:
             raise
         except Exception:

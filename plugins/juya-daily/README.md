@@ -47,7 +47,7 @@ push_time = "09:30"        # 每日推送时间（部署机本地时区，HH:MM�
 catch_up_on_start = true   # 启动时补发今天还没推的一期
 
 [subscribe]
-static_chats = []          # 静态订阅群号列表（兜底，与自助订阅叠加）
+static_chats = []          # 静态订阅群号列表（兜底，与自助订阅叠加；防重复推送同样生效）
 static_platform = "qq"
 admin_only = false         # 仅管理员可订阅/退订
 
@@ -63,10 +63,10 @@ stale_deadline = "12:00"   # 当天一期超过这个时间还没发布就放弃
 
 ## 设计要点
 
-- **订阅状态、每群最后推送日期、最近一期缓存** 均持久化在 `data/plugins/com.juya.daily/state.json`（原子写），防止重启后重复推送。
+- **订阅状态、每群最后推送日期、最近一期缓存** 均持久化在 `data/plugins/com.juya.daily/state.json`（原子写），防止重启后重复推送；自助订阅与静态订阅群共用同一份推送进度，静态群即使未订阅也会记录「已推过今天」。
 - **无 SDK 定时组件**，插件用 asyncio 后台任务自建每日定时器；热重载（新建 Runner 进程）时任务随插件卸载而取消，状态由落盘保证。
-- **容错**：RSS/Atom 宽容解析 + HTML 兜底；推送失败按 `retry_minutes × retry_times` 重试；当天早报未发布时每 30 分钟重查，到 `stale_deadline` 放弃。
-- **风控友好**：启动补推与多群推送之间随机错峰 30–120 秒。
+- **容错**：RSS/Atom 宽容解析 + HTML 兜底；日期优先从标题/正文抽取（pubDate 仅兜底）；推送失败按 `retry_minutes × retry_times` 重试；当天早报未发布时每 30 分钟重查，到 `stale_deadline` 放弃。
+- **风控友好**：启动补推与多群推送时各单位并发发起、各自随机延迟 30–120 秒，群多时总耗时取决于最慢一个。
 
 ## 注意
 

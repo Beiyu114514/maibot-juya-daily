@@ -2,16 +2,23 @@
 
 结构：
 {
-  "version": 1,
+  "version": 2,
   "subscriptions": {
     "<stream_id>": {
       "group_id": "12345" | null,
-      "last_pushed_date": "2026-06-13" | null,
       "subscribed_at": "2026-06-13T00:00:00+00:00"
     }
   },
+  "push_progress": {
+    "<stream_id>": "2026-06-13"   # 每个推送目标最近一次成功推送的日期
+  },
   "last_fetch": { ...Issue.to_dict()... } | null
 }
+
+说明：
+- subscriptions 只放「自助订阅」的会话，判断是否订阅看这里。
+- push_progress 覆盖所有推送目标（含静态群），用于防重复推送；
+  静态群不在 subscriptions 里，所以推送进度必须独立于订阅表记录。
 """
 
 from __future__ import annotations
@@ -22,8 +29,9 @@ import threading
 from datetime import datetime, timezone
 
 DEFAULT_STATE = {
-    "version": 1,
+    "version": 2,
     "subscriptions": {},
+    "push_progress": {},
     "last_fetch": None,
 }
 
@@ -45,6 +53,11 @@ class Store:
             if isinstance(data, dict):
                 merged = json.loads(json.dumps(DEFAULT_STATE))
                 merged.update({k: v for k, v in data.items() if k in DEFAULT_STATE})
+                # v1 -> v2 迁移：把订阅表里的旧 push 进度搬到 push_progress
+                for stream_id, sub in merged["subscriptions"].items():
+                    old_date = (sub or {}).pop("last_pushed_date", None)
+                    if old_date:
+                        merged["push_progress"].setdefault(stream_id, old_date)
                 self._data = merged
         except FileNotFoundError:
             pass
@@ -76,7 +89,6 @@ class Store:
                 return False
             subs[stream_id] = {
                 "group_id": group_id,
-                "last_pushed_date": None,
                 "subscribed_at": datetime.now(timezone.utc).isoformat(),
             }
             self.save()
@@ -91,7 +103,8 @@ class Store:
             return False
 
     def is_subscribed(self, stream_id: str) -> bool:
-        return stream_id in self._data["subscriptions"]
+        with self._lock:
+            return stream_id in self._data["subscriptions"]
 
     def subscriptions(self) -> dict:
         with self._lock:
@@ -100,15 +113,18 @@ class Store:
     # ---------- 每群推送进度 ----------
 
     def last_pushed_date(self, stream_id: str) -> str | None:
-        sub = self._data["subscriptions"].get(stream_id)
-        return (sub or {}).get("last_pushed_date")
+        with self._lock:
+            # 兼容 v1 数据：迁移遗漏时仍能从订阅表里读到旧进度
+            progress = self._data.get("push_progress") or {}
+            if stream_id in progress:
+                return progress.get(stream_id) or None
+            sub = self._data["subscriptions"].get(stream_id)
+            return (sub or {}).get("last_pushed_date")
 
     def set_last_pushed(self, stream_id: str, date: str) -> None:
         with self._lock:
-            sub = self._data["subscriptions"].get(stream_id)
-            if sub is not None:
-                sub["last_pushed_date"] = date
-                self.save()
+            self._data.setdefault("push_progress", {})[stream_id] = date
+            self.save()
 
     # ---------- 最近一期缓存 ----------
 
@@ -118,4 +134,5 @@ class Store:
             self.save()
 
     def get_last_fetch(self) -> dict | None:
-        return self._data.get("last_fetch")
+        with self._lock:
+            return self._data.get("last_fetch")

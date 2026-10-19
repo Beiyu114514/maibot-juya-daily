@@ -127,7 +127,9 @@ def _parse_pub_date(raw: str) -> datetime:
                 return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
         except (TypeError, ValueError, IndexError):
             pass
-    return datetime.now(timezone.utc)
+    # 解析失败时给一个明确的过去时间：避免 pubDate 异常的条目
+    # 用「现在」抢占 max(issues, key=pub_dt) 误导「最新一期」判断
+    return datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 def clean_text(text: str) -> str:
@@ -179,13 +181,18 @@ def parse_rss(data: bytes) -> list[Issue]:
             continue
         raw_pub = fields.get("pubdate") or fields.get("published") or fields.get("updated") or ""
         pub_dt = _parse_pub_date(raw_pub)
+        title = clean_text(fields.get("title", ""))
+        body_clean = clean_body(body)
+        # 日期优先从标题/正文抽取（站点「期号日期」以内容为准），
+        # pubDate 仅作兜底——站点调整发布时间时不会把 date 带偏一天
+        date = _extract_date(title) or _extract_date(body_clean[:500]) or pub_dt.astimezone(CST).strftime("%Y-%m-%d")
         issues.append(
             Issue(
-                title=clean_text(fields.get("title", "")),
+                title=title,
                 link=fields.get("link", ""),
-                date=pub_dt.astimezone(CST).strftime("%Y-%m-%d"),
+                date=date,
                 pub_dt=pub_dt,
-                content=clean_body(body),
+                content=body_clean,
                 source="rss",
             )
         )

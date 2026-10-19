@@ -20,9 +20,30 @@ _ITEM_HEAD_RE = re.compile(r"(?m)^.{0,120}?#[0-9]{1,3}\s*$")
 _OVERVIEW_LINE_RE = re.compile(r"(?m)^.{0,120}↗\s*#[0-9]{1,3}\s*$")
 
 
+# 站点一期内容的固定结构：标题/视频版 → 「概览」（带 ↗ 的索引行）→ 按分组的正文条目。
+# 索引行和分组小标题在推送纯文本里属于噪音：索引会与正文重复，分组词单独成行没信息量。
+_GROUP_TITLE_RE = re.compile(r"(?m)^要闻\s*$|^技术与洞察\s*$|^前瞻与传闻\s*$")
+# 收尾的站点页脚（纯操作提示，无资讯内容）
+_TAIL_NOISE_RE = re.compile(
+    r"提示：内容由AI辅助创作.*?查看网页全文(?:\s*·\s*查看 Markdown)?\s*$", re.DOTALL
+)
+# 带「：」引导的视频版行
+_VIDEO_LINE_RE = re.compile(r"(?m)^视频版：[^\n]*$")
+
+
 def _strip_overview_lines(text: str) -> str:
     """删掉「标题 ↗ #N」概览索引行（含其后的空行），返回清理后的文本。"""
     return _OVERVIEW_LINE_RE.sub("", text).replace("\n\n\n", "\n\n").strip()
+
+
+def _strip_noise(text: str) -> str:
+    """剥掉推送场景下的纯噪音：概览索引行、收尾页脚、视频版行、分组小标题。"""
+    text = _strip_overview_lines(text)
+    text = _TAIL_NOISE_RE.sub("", text)
+    text = _VIDEO_LINE_RE.sub("", text)
+    text = _GROUP_TITLE_RE.sub("", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def split_items(content: str) -> list[str]:
@@ -36,12 +57,12 @@ def split_items(content: str) -> list[str]:
     if len(heads) < 2:
         return [content.strip()] if content.strip() else []
     parts: list[str] = []
-    intro = content[: heads[0].start()].strip()
+    intro = _strip_noise(content[: heads[0].start()])
     if intro:
         parts.append(intro)
     for idx, head in enumerate(heads):
         end = heads[idx + 1].start() if idx + 1 < len(heads) else len(content)
-        chunk = content[head.start() : end].strip()
+        chunk = _strip_noise(content[head.start() : end])
         if chunk:
             parts.append(chunk)
     return parts
@@ -66,12 +87,11 @@ def format_issue(
     lines = [f"📰 {title}"]
     if stale:
         lines.append(f"（暂未抓到今天的一期，以下为最近缓存：{issue.date or '日期未知'}）")
-    body = issue.content or ""
+    body = _strip_noise(issue.content or "")
     if max_items and max_items > 0:
         items = split_items(body)
         if len(items) > max_items:
-            trimmed = [_strip_overview_lines(item) for item in items[:max_items]]
-            body = "\n\n".join(trimmed) + f"\n\n……（仅展示前 {max_items} 条，完整内容见原文）"
+            body = "\n\n".join(items[:max_items]) + f"\n\n……（仅展示前 {max_items} 条，完整内容见原文）"
     if body:
         lines.append(body)
     footer = _fill(footer_template or DEFAULT_FOOTER, link=issue.link, date=issue.date, title=title)
