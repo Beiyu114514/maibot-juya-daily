@@ -11,9 +11,12 @@ sys.path.insert(0, os.path.join(HERE, "..", "plugins", "juya-daily"))
 
 from fetcher import Issue  # noqa: E402
 from formatter import (  # noqa: E402
+    MARKDOWN_CHAR_LIMIT,
     MESSAGE_CHAR_LIMIT,
     _strip_noise,
+    markdown_to_plain,
     paginate_issue,
+    paginate_issue_markdown,
     split_issue,
     split_items,
 )
@@ -343,6 +346,69 @@ class FooterTemplateTest(unittest.TestCase):
         text = "\n".join(paginate_issue(make_issue(), footer_template="{unknown} {link}"))
         self.assertIn("{unknown}", text)
         self.assertIn("https://daily.juya.uk/issue-123/", text)
+
+
+class MarkdownFormatterTest(unittest.TestCase):
+    """QQ Markdown 渲染：只用平台支持的语法，长度按适配器上限兜底。"""
+
+    def test_render_uses_supported_markdown(self) -> None:
+        pages = paginate_issue_markdown(make_issue())
+        text = "\n\n".join(pages)
+        self.assertTrue(pages[0].startswith("## 📰 橘鸦AI早报 #123"))
+        self.assertIn("**某模型发布新版本 #1**", text)
+        self.assertIn("[查看原文](https://daily.juya.uk/issue-123/)", text)
+        self.assertIn("> — 来源：橘鸦AI早报", text)
+        self.assertEqual(text.count("来源：橘鸦AI早报"), 1)
+
+    def test_each_page_within_limit(self) -> None:
+        body = "第 1 条标题 #1\n" + "正" * (MARKDOWN_CHAR_LIMIT * 2)
+        for limit in (300, 400, MARKDOWN_CHAR_LIMIT):
+            pages = paginate_issue_markdown(make_issue(body), limit=limit)
+            self.assertGreater(len(pages), 1)
+            for page in pages:
+                self.assertLessEqual(len(page), limit)
+            # 正文不丢字：分页只插页码，不截断内容
+            self.assertEqual("\n".join(pages).count("正"), MARKDOWN_CHAR_LIMIT * 2)
+
+    def test_page_marker_only_when_multiple_pages(self) -> None:
+        single = paginate_issue_markdown(make_issue())
+        self.assertEqual(len(single), 1)
+        self.assertNotIn("（第 1/", single[0])
+
+        pages = paginate_issue_markdown(make_issue("第 1 条标题 #1\n" + "正" * 2000), limit=300)
+        self.assertGreater(len(pages), 1)
+        self.assertIn("（第 1/", pages[0])
+        self.assertIn(f"（第 {len(pages)}/{len(pages)} 页）", pages[-1])
+
+    def test_stale_and_max_items(self) -> None:
+        pages = paginate_issue_markdown(make_issue(), max_items=1, stale=True)
+        text = "\n".join(pages)
+        self.assertIn("暂未抓到今天的一期", text)
+        self.assertIn("仅展示前 1 条", text)
+        self.assertIn("**某模型发布新版本 #1**", text)
+        self.assertNotIn("某框架发布 3.0", text)
+
+    def test_custom_footer_linkified(self) -> None:
+        pages = paginate_issue_markdown(
+            make_issue(), footer_template="来源：{title} {link}"
+        )
+        self.assertIn(
+            "> 来源：橘鸦AI早报 #123 [查看原文](https://daily.juya.uk/issue-123/)",
+            pages[-1],
+        )
+
+    def test_markdown_to_plain_strips_syntax(self) -> None:
+        md = "## 📰 标题\n\n**条目 #1**\n\n> — 来源：[查看原文](https://x.test/a)"
+        plain = markdown_to_plain(md)
+        self.assertNotIn("##", plain)
+        self.assertNotIn("**", plain)
+        self.assertNotIn("](", plain)
+        self.assertIn("📰 标题", plain)
+        self.assertIn("来源：查看原文（https://x.test/a）", plain)
+
+    def test_markdown_limit_leaves_room_for_adapter_cap(self) -> None:
+        self.assertEqual(MARKDOWN_CHAR_LIMIT, 3800)
+        self.assertLess(MARKDOWN_CHAR_LIMIT, 4000)  # qq-official-adapter 的硬上限
 
 
 if __name__ == "__main__":

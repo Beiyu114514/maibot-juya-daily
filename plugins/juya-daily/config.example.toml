@@ -20,6 +20,9 @@ static_platform = "qq"
 admin_only = false
 
 [push]
+# 消息格式：text=纯文本；markdown=QQ Markdown（需支持 qq_markdown 自定义段的适配器，
+# 如 WhiteCloudOL/qq-official-adapter；发送失败会自动回退纯文本）
+message_format = "text"
 # 每期最多推送的资讯条数，0 表示全部
 max_items = 0
 # 脚注模板，支持 {link} {date} {title} 占位

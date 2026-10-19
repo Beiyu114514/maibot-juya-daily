@@ -2,6 +2,20 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.4.0] - 2026-10-19
+
+### 新增
+
+- **QQ Markdown 推送**：新增 `[push] message_format = "text" | "markdown"`。`markdown` 模式把早报渲染成 QQ 官方 Markdown（`##` 标题、`**加粗**`、`>` 引用、`[查看原文](url)` 链接），经 `ctx.send.custom("qq_markdown", {"markdown": {"content": ...}})` 走结构化消息（`msg_type=2`），适配 [WhiteCloudOL/qq-official-adapter](https://github.com/WhiteCloudOL/qq-official-adapter)；单条按 3800 字分页（适配器硬上限 4000），发送失败或抛异常自动回退同内容纯文本
+- `/早报`、定时推送、断点续传共用同一渲染与发送路径，格式随配置热切换；默认仍为 `text`，老配置行为不变
+- manifest 新增 `send.custom` 能力声明
+
+### 工程化
+
+- formatter 新增 `paginate_issue_markdown()` / `markdown_to_plain()`，纯文本与 Markdown 共用 `_prepare_issue()` 拆标题/导语/条目/脚注
+- 测试 165 → 176：Markdown 分页上限、页码/截断/脚注、语法降级回退、`send.custom` 段结构与失败回退
+- 版本 0.4.0（manifest / README / config.example.toml 同步）
+
 ## [0.3.1] - 2026-10-19
 
 ### 修复
