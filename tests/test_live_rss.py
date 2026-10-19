@@ -16,7 +16,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "plugins", "juya-daily"))
 
 from fetcher import RSS_URL, JuyaFetcher, parse_rss, today_cst  # noqa: E402
-from formatter import MESSAGE_CHAR_LIMIT, paginate_issue  # noqa: E402
+from formatter import (  # noqa: E402
+    MARKDOWN_CHAR_LIMIT,
+    MESSAGE_CHAR_LIMIT,
+    paginate_issue,
+    paginate_issue_markdown,
+)
 
 LIVE = os.environ.get("JUYA_LIVE") == "1"
 
@@ -43,6 +48,15 @@ class LiveRssTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(page.strip(), "每一页都应有内容")
         self.assertIn("📰", pages[0], "首页应带标题")
         self.assertIn("https://daily.juya.uk/", pages[-1])
+
+        # 同一期也走一遍 Markdown 渲染：真实数据下的语法与长度上限
+        md_pages = paginate_issue_markdown(issue, max_items=3)
+        self.assertTrue(md_pages)
+        for page in md_pages:
+            self.assertLessEqual(len(page), MARKDOWN_CHAR_LIMIT)
+            self.assertTrue(page.strip(), "每一页都应有内容")
+        self.assertTrue(md_pages[0].startswith("## 📰"), "Markdown 首页应以二级标题开头")
+        self.assertIn("[查看原文](https://daily.juya.uk/", md_pages[-1])
         self.assertNotIn("↗", "\n".join(pages))  # 概览索引行已剥离
         self.assertNotIn("AI辅助创作", "\n".join(pages))  # 站点页脚噪音已剥离
 

@@ -198,11 +198,20 @@ def make_long_issue(date: str, items: int = 24) -> Issue:
 class FakeSend:
     """记录发送内容，可按 stream_id 模拟失败/抛异常。"""
 
-    def __init__(self, fail_streams=(), raise_streams=(), fail_pages=()):
+    def __init__(
+        self,
+        fail_streams=(),
+        raise_streams=(),
+        fail_pages=(),
+        fail_markdown=False,
+    ):
         self.fail_streams = set(fail_streams)
         self.raise_streams = set(raise_streams)
         self.fail_pages = set(fail_pages)  # 第几页失败（1 起）
+        self.fail_markdown = fail_markdown  # 只让 custom（Markdown）失败
         self.calls: list[tuple[str, str]] = []
+        self.custom_calls: list[tuple[str, str, dict]] = []
+        self.custom_kwargs: list[dict] = []
 
     async def text(self, text, stream_id, *, return_details=False, **_kwargs):
         index = len([c for c in self.calls if c[0] == stream_id]) + 1
@@ -212,6 +221,16 @@ class FakeSend:
         if stream_id in self.fail_streams or index in self.fail_pages:
             return {"sent": False, "message_id": None} if return_details else False
         return {"sent": True, "message_id": f"m{len(self.calls)}"} if return_details else True
+
+    async def custom(self, custom_type, data, stream_id, *, return_details=False, **kwargs):
+        index = len([c for c in self.custom_calls if c[0] == str(stream_id)]) + 1
+        self.custom_calls.append((str(stream_id), str(custom_type), data))
+        self.custom_kwargs.append(dict(kwargs))
+        if stream_id in self.raise_streams:
+            raise RuntimeError("发送通道炸了")
+        if stream_id in self.fail_streams or self.fail_markdown or index in self.fail_pages:
+            return {"sent": False, "message_id": None} if return_details else False
+        return {"sent": True, "message_id": f"c{len(self.custom_calls)}"} if return_details else True
 
 
 class FakeChat:
@@ -348,6 +367,9 @@ class EntryPointTest(unittest.TestCase):
         self.assertEqual(manifest["manifest_version"], 2)
         for key in ("id", "version", "name", "sdk", "host_application", "capabilities"):
             self.assertIn(key, manifest)
+        self.assertIn("send.text", manifest["capabilities"])
+        # Markdown 模式走结构化自定义消息，manifest 必须显式申请该能力
+        self.assertIn("send.custom", manifest["capabilities"])
         config = JuyaDailyConfig()
         self.assertIsInstance(config.plugin.config_version, str)
         self.assertTrue(config.plugin.config_version)
@@ -450,6 +472,7 @@ class ConfigModelTest(unittest.TestCase):
         self.assertTrue(cfg.plugin.enabled)
         self.assertEqual(cfg.schedule.push_time, "09:30")
         self.assertEqual(cfg.push.max_items, 0)
+        self.assertEqual(cfg.push.message_format, "text")
         self.assertEqual(cfg.push.stagger_min_seconds, 30)
         self.assertEqual(cfg.push.stagger_max_seconds, 120)
 
@@ -643,6 +666,85 @@ class PushTest(unittest.TestCase):
                 plugin_module.asyncio = real_asyncio
             self.assertEqual(plugin._store.last_pushed_date("s1"), "2026-10-19")
             self.assertEqual(slept, [600, 600])  # 第 1 轮失败 → 第 2 轮重试成功
+
+        asyncio.run(scenario())
+
+
+class MarkdownPushTest(unittest.TestCase):
+    """QQ Markdown 模式：走 send.custom("qq_markdown")，失败回退纯文本。"""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp()
+
+    def _markdown_plugin(self, send=None):
+        return build_plugin(
+            self.tmp,
+            send=send,
+            push={"message_format": "markdown"},
+        )
+
+    def test_markdown_mode_sends_structured_custom(self) -> None:
+        async def scenario() -> None:
+            send = FakeSend()
+            plugin = self._markdown_plugin(send)
+            plugin._store.subscribe("s1", "10001")
+            self.assertTrue(await plugin._push_one("s1", make_issue("2026-10-19")))
+            self.assertEqual(send.calls, [])  # 没有走纯文本
+            self.assertGreaterEqual(len(send.custom_calls), 1)
+            for stream_id, custom_type, data in send.custom_calls:
+                self.assertEqual(stream_id, "s1")
+                self.assertEqual(custom_type, "qq_markdown")
+                content = data["markdown"]["content"]
+                self.assertTrue(content.startswith("## 📰"), content[:40])
+                self.assertLessEqual(len(content), 4000)  # 适配器 MAX_OUTBOUND_MARKDOWN_CHARS
+            # 宿主写入历史/上下文的纯文本不应带 Markdown 记号
+            history_text = send.custom_kwargs[0]["processed_plain_text"]
+            self.assertIn("📰", history_text)
+            self.assertNotIn("## ", history_text)
+            self.assertNotIn("**", history_text)
+            self.assertEqual(plugin._store.last_pushed_date("s1"), "2026-10-19")
+
+        asyncio.run(scenario())
+
+    def test_markdown_failure_falls_back_to_plain_text(self) -> None:
+        async def scenario() -> None:
+            send = FakeSend(fail_markdown=True)
+            plugin = self._markdown_plugin(send)
+            plugin._store.subscribe("s1", "10001")
+            self.assertTrue(await plugin._push_one("s1", make_issue("2026-10-19")))
+            self.assertGreaterEqual(len(send.custom_calls), 1)
+            self.assertGreaterEqual(len(send.calls), 1)
+            fallback = send.calls[0][1]
+            self.assertIn("📰", fallback)
+            self.assertNotIn("## ", fallback)
+            self.assertNotIn("**", fallback)
+            self.assertEqual(plugin._store.last_pushed_date("s1"), "2026-10-19")
+
+        asyncio.run(scenario())
+
+    def test_markdown_exception_falls_back_to_plain_text(self) -> None:
+        class _RaiseMarkdown(FakeSend):
+            async def custom(self, *args, **kwargs):
+                raise RuntimeError("适配器不可用")
+
+        async def scenario() -> None:
+            send = _RaiseMarkdown()
+            plugin = self._markdown_plugin(send)
+            plugin._store.subscribe("s1", "10001")
+            self.assertTrue(await plugin._push_one("s1", make_issue("2026-10-19")))
+            self.assertGreaterEqual(len(send.calls), 1)
+            self.assertIn("📰", send.calls[0][1])
+
+        asyncio.run(scenario())
+
+    def test_text_mode_never_uses_custom(self) -> None:
+        async def scenario() -> None:
+            send = FakeSend()
+            plugin = build_plugin(self.tmp, send=send)
+            plugin._store.subscribe("s1", "10001")
+            self.assertTrue(await plugin._push_one("s1", make_issue("2026-10-19")))
+            self.assertEqual(send.custom_calls, [])
+            self.assertGreaterEqual(len(send.calls), 1)
 
         asyncio.run(scenario())
 

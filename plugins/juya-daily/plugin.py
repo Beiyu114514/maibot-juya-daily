@@ -16,12 +16,18 @@ import os
 import random
 import time
 from datetime import time as dtime
+from typing import Literal
 
 from pydantic import Field
 
 try:  # 以包形式加载（plugins.juya_daily.plugin）
     from .fetcher import Issue, JuyaFetcher, now_cst, today_cst
-    from .formatter import DEFAULT_FOOTER, paginate_issue
+    from .formatter import (
+        DEFAULT_FOOTER,
+        markdown_to_plain,
+        paginate_issue,
+        paginate_issue_markdown,
+    )
     from .scheduler import DailyScheduler, parse_hhmm
     from .store import Store
 except ImportError:  # 以目录形式直接加载时的兜底
@@ -32,7 +38,12 @@ except ImportError:  # 以目录形式直接加载时的兜底
     if _HERE not in _sys.path:
         _sys.path.insert(0, _HERE)
     from fetcher import Issue, JuyaFetcher, now_cst, today_cst
-    from formatter import DEFAULT_FOOTER, paginate_issue
+    from formatter import (
+        DEFAULT_FOOTER,
+        markdown_to_plain,
+        paginate_issue,
+        paginate_issue_markdown,
+    )
     from scheduler import DailyScheduler, parse_hhmm
     from store import Store
 
@@ -108,6 +119,14 @@ class PushSection(PluginConfigBase):
     __ui_icon__ = "send"
     __ui_order__ = 4
 
+    message_format: Literal["text", "markdown"] = Field(
+        "text",
+        description=(
+            "消息格式：text=纯文本；markdown=QQ Markdown（需使用支持 qq_markdown "
+            "自定义段的适配器，如 WhiteCloudOL/qq-official-adapter）"
+        ),
+        json_schema_extra={"label": "消息格式"},
+    )
     max_items: int = Field(
         0,
         description="每期最多推送的资讯条数，0 表示全部",
@@ -274,15 +293,10 @@ class JuyaDailyPlugin(MaiBotPlugin):
             return (False, "no issue", 2)
         self._store.set_last_fetch(issue.to_dict())
         stale = issue.date != today_cst()
-        pages = paginate_issue(
-            issue,
-            max_items=int(self.config.push.max_items or 0),
-            footer_template=self.config.push.footer or DEFAULT_FOOTER,
-            stale=stale,
-        )
+        message_format, pages = self._render_pages(issue, stale=stale)
         if stream_id:
             for page in pages:
-                await self._send_text(page, stream_id)
+                await self._send_page(page, stream_id, message_format)
         else:
             self.ctx.logger.warning("/早报 缺少 stream_id，只能记录日志：%s", pages[0][:80])
         return (True, "ok", 2)
@@ -487,6 +501,59 @@ class JuyaDailyPlugin(MaiBotPlugin):
                 targets.append(stream_id)
         return targets
 
+    def _render_pages(self, issue: Issue, stale: bool = False) -> tuple[str, list[str]]:
+        """按 ``push.message_format`` 渲染分页消息，返回 (格式, 页列表)。"""
+        message_format = str(self.config.push.message_format or "text").strip().lower()
+        max_items = int(self.config.push.max_items or 0)
+        footer_template = self.config.push.footer or DEFAULT_FOOTER
+        if message_format == "markdown":
+            return "markdown", paginate_issue_markdown(
+                issue,
+                max_items=max_items,
+                footer_template=footer_template,
+                stale=stale,
+            )
+        return "text", paginate_issue(
+            issue,
+            max_items=max_items,
+            footer_template=footer_template,
+            stale=stale,
+        )
+
+    async def _send_markdown(self, text: str, stream_id: str) -> bool:
+        """以 QQ 结构化消息发送一段 Markdown（qq-official-adapter 的 qq_markdown 段）。
+
+        Host 会把 ``custom`` 包成 ``dict`` 消息段，适配器识别到
+        ``qq_markdown`` / ``qq_official_markdown`` 后按 ``msg_type=2`` 发出。
+        """
+        try:
+            result = await self.ctx.send.custom(
+                "qq_markdown",
+                {"markdown": {"content": text}},
+                str(stream_id),
+                return_details=True,
+                # 让宿主把可读正文写进消息/上下文，避免历史里只剩「[qq_markdown消息]」
+                processed_plain_text=markdown_to_plain(text),
+            )
+        except Exception as exc:
+            self.ctx.logger.error("Markdown 推送到 %s 失败: %s", stream_id, exc)
+            return False
+        if isinstance(result, dict):
+            sent = bool(result.get("sent"))
+            if not sent:
+                self.ctx.logger.warning("Markdown 推送到 %s 未成功: %r", stream_id, result)
+            return sent
+        return bool(result)
+
+    async def _send_page(self, page: str, stream_id: str, message_format: str = "text") -> bool:
+        """按格式发送一页；Markdown 失败时自动回退纯文本，避免整期推送失败。"""
+        if message_format != "markdown":
+            return await self._send_text(page, stream_id)
+        if await self._send_markdown(page, stream_id):
+            return True
+        self.ctx.logger.warning("Markdown 发送失败，回退纯文本：%s", stream_id)
+        return await self._send_text(markdown_to_plain(page), stream_id)
+
     async def _send_text(self, text: str, stream_id: str) -> bool:
         """发送文本并严格判定结果。
 
@@ -519,16 +586,12 @@ class JuyaDailyPlugin(MaiBotPlugin):
             state = self._store.push_state(stream_id)
             if state["date"] == issue.date and state["done"]:
                 return True
-            pages = paginate_issue(
-                issue,
-                max_items=int(self.config.push.max_items or 0),
-                footer_template=self.config.push.footer or DEFAULT_FOOTER,
-            )
+            message_format, pages = self._render_pages(issue)
             start = state["page"] if state["date"] == issue.date else 0
             if start >= len(pages):
                 start = 0  # 内容改版后页数变少，从头再发
             for index in range(start, len(pages)):
-                if not await self._send_text(pages[index], stream_id):
+                if not await self._send_page(pages[index], stream_id, message_format):
                     if index > 0:
                         self.ctx.logger.warning(
                             "推送到 %s 的第 %d/%d 页失败，已发出的页无法撤回，重试将从该页继续",

@@ -1,6 +1,6 @@
 # 橘鸦AI早报（juya-daily）
 
-MaiBot 插件：订阅 [橘鸦AI早报](https://daily.juya.uk/)，每天定时把最新一期 AI 资讯以纯文本推送到订阅的群/会话，也支持 `/早报` 随时查看。
+MaiBot 插件：订阅 [橘鸦AI早报](https://daily.juya.uk/)，每天定时把最新一期 AI 资讯推送到订阅的群/会话（默认纯文本，可选 QQ Markdown），也支持 `/早报` 随时查看。
 
 数据源为站点官方 RSS `https://daily.juya.uk/rss.xml`（每期全文内嵌），HTML 解析仅作兜底。
 
@@ -39,7 +39,21 @@ MaiBot 插件：订阅 [橘鸦AI早报](https://daily.juya.uk/)，每天定时�
 | `/早报退订` | 取消订阅（当前会话） |
 | `/早报状态` | 查看订阅状态、推送时间与最近一期 |
 
-推送内容为纯文本：日期标题 + 编号条目 + 脚注（含原文链接与「AI 辅助生成，可能存在错误」提示）。
+推送内容为日期标题 + 编号条目 + 脚注（含原文链接与「AI 辅助生成，可能存在错误」提示）。默认是纯文本；把 `[push] message_format` 设为 `"markdown"` 后改为 QQ Markdown（标题、加粗、可点击原文链接，单条上限 3800 字）。
+
+## QQ Markdown 推送
+
+Markdown 模式通过 **结构化自定义消息** 发送（宿主 `send.custom` → 适配器 `qq_markdown` 段 → QQ `msg_type=2`），需要适配器支持该消息段。目前验证过的组合是 [WhiteCloudOL/qq-official-adapter](https://github.com/WhiteCloudOL/qq-official-adapter) + QQ 官方机器人（群聊/单聊）。
+
+```toml
+[push]
+message_format = "markdown"
+```
+
+- 适配器不需要打开「启用 Markdown 输出」开关：该开关只是把**普通文本回复**也按 Markdown 发送；本插件走的是显式结构化消息，与该开关相互独立。
+- 该适配器对 Markdown 单条限制 4000 字符，插件按 3800 字分页并保留页码；发送失败会自动降级为同内容纯文本，不会让整期推送失败。
+- 只使用 QQ 官方 Markdown 支持的语法（`#`/`##` 标题、`**加粗**`、`>` 引用、`[文字](url)` 链接），不使用代码块与表格。
+- 其他适配器（如 NapCat/SnowLuma 统一连接器）没有 `qq_markdown` 段，会把它当未知段降级成 `[unsupported:qq_markdown]` 文本；这类环境请保持默认 `message_format = "text"`。
 
 ## 配置（config.toml）
 
@@ -54,6 +68,7 @@ static_platform = "qq"
 admin_only = false         # 仅管理员可订阅/退订
 
 [push]
+message_format = "text"    # text=纯文本；markdown=QQ Markdown（需适配器支持 qq_markdown 段）
 max_items = 0              # 每期最多推几条，0 = 全部
 footer = "…"               # 脚注模板，支持 {link} {date} {title}
 retry_minutes = 10         # 推送失败重试间隔
@@ -71,7 +86,7 @@ stale_deadline = "12:00"   # 当天一期超过这个时间还没发布就放弃
 - **无 SDK 定时组件**，插件用 asyncio 后台任务自建每日定时器；热重载（新建 Runner 进程）时任务随插件卸载而取消，状态由落盘保证。
 - **容错**：RSS/Atom 宽容解析 + HTML 兜底；日期优先从标题/正文抽取（pubDate 仅兜底）；推送失败按 `retry_minutes × retry_times` 重试；当天早报未发布时每 30 分钟重查，到 `stale_deadline` 放弃。
 - **风控友好**：启动补推与多群推送并发发起，各目标随机错峰 30–120 秒（`stagger_min_seconds` / `stagger_max_seconds`），单目标重复触发会被进程内去重。
-- **分页发送**：整期内容按「条」打包成多条消息，单条不超过 1800 字，避免被 QQ 截断；末页带来源脚注。
+- **分页发送**：整期内容按「条」打包成多条消息，纯文本单条不超过 1800 字、Markdown 单条不超过 3800 字，避免被 QQ 截断；末页带来源脚注。
 - **链接格式兼容**：站点早期用 `/issue-N/`、现改为 `/issues/YYYY-MM-DD/`，RSS 与 HTML 兜底两种都认。
 
 ## 开发
