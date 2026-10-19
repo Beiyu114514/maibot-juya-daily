@@ -29,7 +29,10 @@ RETRY_BACKOFF = 2  # 第 n 次重试前等待 n*RETRY_BACKOFF 秒
 
 _MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
 _TAG_RE = re.compile(r"</?[a-zA-Z][a-zA-Z0-9]*(?:\s[^>]*)?>")
-_ISSUE_LINK_RE = re.compile(r"""href=["']([^"']*issue-\d+/?)["']""", re.IGNORECASE)
+# 站点改过版：早期链接是 /issue-N/，现在是 /issues/YYYY-MM-DD/，两种都要认
+_ISSUE_LINK_RE = re.compile(
+    r"""href=["']([^"']*(?:issue-\d+/|issues/20\d{2}-\d{2}-\d{2}/?))["']""", re.IGNORECASE
+)
 _DATE_RE = re.compile(r"(20\d{2})[-/年.](\d{1,2})[-/月.](\d{1,2})")
 
 
@@ -74,9 +77,14 @@ class Issue:
         )
 
 
+def now_cst() -> datetime:
+    """当前时刻（东八区）。站点按东八区发布，所有「今天/到点了没」判断都以此为基准。"""
+    return datetime.now(CST)
+
+
 def today_cst(now: datetime | None = None) -> str:
     """今天的日期（东八区），如 2026-06-13。"""
-    return (now or datetime.now(CST)).strftime("%Y-%m-%d")
+    return (now or now_cst()).strftime("%Y-%m-%d")
 
 
 class FetchError(Exception):
@@ -119,14 +127,25 @@ def _local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1].lower()
 
 
+def _from_isoformat(raw: str) -> datetime | None:
+    """ISO 8601 兜底（Atom 的 published/updated、以及带 Z 后缀的形式）。"""
+    text = (raw or "").strip()
+    if not text:
+        return None
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    return datetime.fromisoformat(text)
+
+
 def _parse_pub_date(raw: str) -> datetime:
     if raw:
-        try:
-            dt = email.utils.parsedate_to_datetime(raw)
+        for parse in (email.utils.parsedate_to_datetime, _from_isoformat):
+            try:
+                dt = parse(raw)
+            except (TypeError, ValueError, IndexError):
+                dt = None
             if dt is not None:
                 return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-        except (TypeError, ValueError, IndexError):
-            pass
     # 解析失败时给一个明确的过去时间：避免 pubDate 异常的条目
     # 用「现在」抢占 max(issues, key=pub_dt) 误导「最新一期」判断
     return datetime(1970, 1, 1, tzinfo=timezone.utc)
@@ -146,8 +165,16 @@ def clean_body(body: str) -> str:
         text = _TAG_RE.sub("", text)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n[ \t]+", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def pick_latest(issues: list[Issue]) -> Issue | None:
+    """从若干期里挑出最新的一期；列表为空返回 None。"""
+    if not issues:
+        return None
+    return max(issues, key=lambda item: item.pub_dt)
 
 
 def parse_rss(data: bytes) -> list[Issue]:
@@ -249,7 +276,7 @@ class JuyaFetcher:
             raw = await _http_get(RSS_URL, self.logger)
             issues = parse_rss(raw)
             if issues:
-                latest = max(issues, key=lambda item: item.pub_dt)
+                latest = pick_latest(issues)
                 latest.source = "rss"
                 self._cache = latest
                 return latest

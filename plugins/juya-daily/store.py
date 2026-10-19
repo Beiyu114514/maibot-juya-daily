@@ -50,23 +50,63 @@ class Store:
         try:
             with open(self.path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if isinstance(data, dict):
-                merged = json.loads(json.dumps(DEFAULT_STATE))
-                merged.update({k: v for k, v in data.items() if k in DEFAULT_STATE})
-                # v1 -> v2 迁移：把订阅表里的旧 push 进度搬到 push_progress
-                for stream_id, sub in merged["subscriptions"].items():
-                    old_date = (sub or {}).pop("last_pushed_date", None)
-                    if old_date:
-                        merged["push_progress"].setdefault(stream_id, old_date)
-                self._data = merged
         except FileNotFoundError:
+            return
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+            self._backup_corrupt(self.path)
+            return
+        if not self._adopt(data):
+            # 结构不认识（版本迁移期最常见）：备份现场，退回默认状态，
+            # 插件继续能加载，只是丢掉旧的订阅/推送进度。
+            self._backup_corrupt(self.path)
+
+    @staticmethod
+    def _backup_corrupt(path: str) -> None:
+        try:
+            os.replace(path, path + ".corrupt")
+        except OSError:
             pass
-        except (json.JSONDecodeError, OSError):
-            # 文件损坏时保留现场备份再从头开始，不静默吞掉
-            try:
-                os.replace(self.path, self.path + ".corrupt")
-            except OSError:
-                pass
+
+    def _adopt(self, data: object) -> bool:
+        """把读到的 JSON 规整成合法状态；返回 False 表示数据不可用（结构损坏）。"""
+        if not isinstance(data, dict):
+            return False
+        version = data.get("version")
+        if not isinstance(version, int):
+            return False
+
+        raw_subs = data.get("subscriptions")
+        raw_progress = data.get("push_progress")
+        raw_fetch = data.get("last_fetch")
+        # 各表都必须是 dict；任何一个是别的类型都视为结构损坏
+        if raw_subs is not None and not isinstance(raw_subs, dict):
+            return False
+        if raw_progress is not None and not isinstance(raw_progress, dict):
+            return False
+        if raw_fetch is not None and not isinstance(raw_fetch, dict):
+            return False
+
+        merged = json.loads(json.dumps(DEFAULT_STATE))
+        merged["version"] = DEFAULT_STATE["version"]
+        if isinstance(raw_subs, dict):
+            merged["subscriptions"] = {
+                str(sid): (sub if isinstance(sub, dict) else {})
+                for sid, sub in raw_subs.items()
+            }
+        if isinstance(raw_progress, dict):
+            merged["push_progress"] = {
+                str(sid): str(date) for sid, date in raw_progress.items() if date
+            }
+        if isinstance(raw_fetch, dict):
+            merged["last_fetch"] = raw_fetch
+
+        # v1 -> v2 迁移：把订阅表里的旧 push 进度搬到 push_progress
+        for stream_id, sub in merged["subscriptions"].items():
+            old_date = sub.pop("last_pushed_date", None)
+            if old_date and stream_id not in merged["push_progress"]:
+                merged["push_progress"][stream_id] = str(old_date)
+        self._data = merged
+        return True
 
     def save(self) -> None:
         with self._lock:
@@ -120,7 +160,6 @@ class Store:
                 return progress.get(stream_id) or None
             sub = self._data["subscriptions"].get(stream_id)
             return (sub or {}).get("last_pushed_date")
-
     def set_last_pushed(self, stream_id: str, date: str) -> None:
         with self._lock:
             self._data.setdefault("push_progress", {})[stream_id] = date

@@ -1,3 +1,11 @@
+# 橘鸦AI早报 · MaiBot 插件配置
+# [plugin] 节为 SDK/Host 约定必备：config_version 缺失会导致插件无法加载
+[plugin]
+# 是否启用插件
+enabled = true
+# 配置结构版本号（Host 用于配置迁移对齐，请勿手改）
+config_version = "2.0.0"
+
 [schedule]
 # 每日推送时间（部署机本地时区，HH:MM）
 push_time = "09:30"

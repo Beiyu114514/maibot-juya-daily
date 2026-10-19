@@ -86,18 +86,28 @@ stale_deadline = "12:00"   # 当天一期超过这个时间还没发布就放弃
 # 语法检查
 python3 -m py_compile plugins/juya-daily/*.py
 
-# 打包（或直接推 v* tag，Actions 自动打包并发布 Release）
-git tag v0.1.1 && git push origin v0.1.1
+# 单元测试（83 项：RSS 解析 / 排版分页 / 状态落盘 / 定时器 / 推送成败判定）
+python3 -m unittest discover -s tests -v
+
+# 真实站点集成测试（会请求 daily.juya.uk，默认跳过）
+JUYA_LIVE=1 python3 -m unittest tests.test_live_rss -v
+
+# 打包（或直接推 v* tag，Actions 自动跑测试、打包并发布 Release）
+git tag v0.2.0 && git push origin v0.2.0
 ```
+
+测试不需要真实 MaiBot 环境：缺 `pydantic` / `maibot_sdk` 时会自动注入最小桩（CI 里装真包，走真实实现）。
+夜间定时任务（`.github/workflows/ci.yml`）会跑一次 `JUYA_LIVE=1`，站点改版能最早发现。
 
 项目结构：
 
 ```text
-.github/workflows/package.yml   # CI：语法检查 + 打包 zip + 发布 Release
+.github/workflows/ci.yml      # CI：单元测试（+ 夜间真实站点冒烟）+ 打包 zip + 发布 Release
+tests/                        # unittest：test_fetcher / test_formatter / test_store / test_plugin / test_live_rss
 plugins/juya-daily/
 ├── plugin.py      # 入口：命令、生命周期、推送编排
 ├── fetcher.py     # RSS 抓取解析（HTML 兜底、重试、当日缓存）
-├── formatter.py   # 纯文本排版（分条、限条数、脚注）
+├── formatter.py   # 纯文本排版（分条、限条数、分页、脚注）
 ├── scheduler.py   # 每日定时器（可热改时间）
 └── store.py       # 订阅状态持久化（原子写）
 ```

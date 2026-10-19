@@ -9,13 +9,13 @@ from __future__ import annotations
 import asyncio
 import os
 import random
-from datetime import datetime, time as dtime
+from datetime import time as dtime
 
 from pydantic import Field
 
 try:  # 以包形式加载（plugins.juya_daily.plugin）
-    from .fetcher import Issue, JuyaFetcher, today_cst
-    from .formatter import DEFAULT_FOOTER, format_issue
+    from .fetcher import Issue, JuyaFetcher, now_cst, today_cst
+    from .formatter import DEFAULT_FOOTER, format_issue, paginate_issue
     from .scheduler import DailyScheduler
     from .store import Store
 except ImportError:  # 以目录形式直接加载时的兜底
@@ -25,8 +25,8 @@ except ImportError:  # 以目录形式直接加载时的兜底
     _HERE = str(_Path(__file__).resolve().parent)
     if _HERE not in _sys.path:
         _sys.path.insert(0, _HERE)
-    from fetcher import Issue, JuyaFetcher, today_cst
-    from formatter import DEFAULT_FOOTER, format_issue
+    from fetcher import Issue, JuyaFetcher, now_cst, today_cst
+    from formatter import DEFAULT_FOOTER, format_issue, paginate_issue
     from scheduler import DailyScheduler
     from store import Store
 
@@ -39,10 +39,33 @@ except ImportError:  # SDK 子模块布局不同时的兜底
 # ---------- 配置模型（Runner 首载自动生成 config.toml + WebUI 表单） ----------
 
 
+class PluginSection(PluginConfigBase):
+    """插件基础配置（SDK/Host 约定必须存在的 ``[plugin]`` 节）。
+
+    ``config_version`` 由 Host 用于配置迁移对齐，缺节或缺字段时
+    Runner 会直接抛 PluginConfigVersionError，插件无法加载。
+    """
+
+    __ui_label__ = "插件"
+    __ui_icon__ = "package"
+    __ui_order__ = 0
+
+    enabled: bool = Field(default=True, description="是否启用插件")
+    config_version: str = Field(
+        "2.0.0",
+        description="配置结构版本号（升级配置结构时递增，Host 据此迁移旧配置）",
+        json_schema_extra={"label": "配置版本"},
+    )
+
+
 class ScheduleSection(PluginConfigBase):
+    __ui_label__ = "定时"
+    __ui_icon__ = "clock"
+    __ui_order__ = 1
+
     push_time: str = Field(
         "09:30",
-        description="每日推送时间（部署机本地时区，HH:MM）。站点一般在东八区 08:45 左右发布当天一期",
+        description="每日推送时间（东八区，HH:MM）。站点一般在东八区 08:45 左右发布当天一期",
         json_schema_extra={"label": "推送时间", "placeholder": "09:30"},
     )
     catch_up_on_start: bool = Field(
@@ -53,6 +76,10 @@ class ScheduleSection(PluginConfigBase):
 
 
 class SubscribeSection(PluginConfigBase):
+    __ui_label__ = "订阅"
+    __ui_icon__ = "bell"
+    __ui_order__ = 3
+
     static_chats: list[str] = Field(
         default_factory=list,
         description="静态订阅群列表（填群号，兜底用；与群内自助订阅叠加）",
@@ -71,6 +98,10 @@ class SubscribeSection(PluginConfigBase):
 
 
 class PushSection(PluginConfigBase):
+    __ui_label__ = "推送"
+    __ui_icon__ = "send"
+    __ui_order__ = 4
+
     max_items: int = Field(
         0,
         description="每期最多推送的资讯条数，0 表示全部",
@@ -99,6 +130,7 @@ class PushSection(PluginConfigBase):
 
 
 class JuyaDailyConfig(PluginConfigBase):
+    plugin: PluginSection = Field(default_factory=PluginSection, description="插件基础配置")
     schedule: ScheduleSection = Field(default_factory=ScheduleSection, description="定时")
     subscribe: SubscribeSection = Field(default_factory=SubscribeSection, description="订阅")
     push: PushSection = Field(default_factory=PushSection, description="推送")
@@ -140,6 +172,7 @@ class JuyaDailyPlugin(MaiBotPlugin):
             push_time=self.config.schedule.push_time,
             on_fire=self._on_schedule_fire,
             logger=self.ctx.logger,
+            now_fn=now_cst,
         )
         await self._scheduler.start()
         self._spawn(self._catch_up_on_start(), "catch-up")
@@ -180,6 +213,7 @@ class JuyaDailyPlugin(MaiBotPlugin):
                     push_time=new_time,
                     on_fire=self._on_schedule_fire,
                     logger=self.ctx.logger,
+                    now_fn=now_cst,
                 )
                 await self._scheduler.start()
         except Exception:
@@ -200,15 +234,19 @@ class JuyaDailyPlugin(MaiBotPlugin):
             await self._reply(kwargs, "暂时抓不到早报（网络或站点异常），稍后再试试吧")
             return (False, "no issue", 2)
         self._store.set_last_fetch(issue.to_dict())
-        await self._reply(
-            kwargs,
-            format_issue(
-                issue,
-                max_items=int(self.config.push.max_items or 0),
-                footer_template=self.config.push.footer or DEFAULT_FOOTER,
-                stale=issue.date != today_cst(),
-            ),
+        stale = issue.date != today_cst()
+        pages = paginate_issue(
+            issue,
+            max_items=int(self.config.push.max_items or 0),
+            footer_template=self.config.push.footer or DEFAULT_FOOTER,
+            stale=stale,
         )
+        stream_id = kwargs.get("stream_id") or kwargs.get("session_id")
+        if stream_id:
+            for page in pages:
+                await self._send_text(page, str(stream_id))
+        else:
+            self.ctx.logger.warning("/早报 缺少 stream_id，只能记录日志：%s", pages[0][:80])
         return (True, "ok", 2)
 
     @Command("juya_daily_sub", pattern=r"^/早报订阅")
@@ -276,7 +314,7 @@ class JuyaDailyPlugin(MaiBotPlugin):
             self.ctx.logger.warning("缺少 stream_id，无法回复消息")
             return
         try:
-            await self.ctx.send.text(text, str(stream_id))
+            await self._send_text(text, str(stream_id))
         except Exception:
             self.ctx.logger.exception("回复消息失败")
 
@@ -368,17 +406,44 @@ class JuyaDailyPlugin(MaiBotPlugin):
                 targets.append(stream_id)
         return targets
 
+    async def _send_text(self, text: str, stream_id: str) -> bool:
+        """发送文本并严格判定结果。
+
+        SDK 的 ``send.text`` 失败时返回 False（不抛异常），
+        也可能返回 ``SendResult{sent: bool, message_id}``。
+        只看抛不抛异常会把失败当成功，导致 last_pushed 被写死。
+        """
+        try:
+            result = await self.ctx.send.text(text, str(stream_id), return_details=True)
+        except Exception as exc:
+            self.ctx.logger.error("推送到 %s 失败: %s", stream_id, exc)
+            return False
+        if isinstance(result, dict):
+            sent = bool(result.get("sent"))
+            if not sent:
+                self.ctx.logger.error("推送到 %s 失败: %r", stream_id, result)
+            return sent
+        if not bool(result):
+            self.ctx.logger.error("推送到 %s 失败: 能力返回 %r", stream_id, result)
+        return bool(result)
+
     async def _push_one(self, stream_id: str, issue: Issue) -> bool:
-        text = format_issue(
+        """推送一期早报（自动分页）；全部页发送成功才算成功。"""
+        pages = paginate_issue(
             issue,
             max_items=int(self.config.push.max_items or 0),
             footer_template=self.config.push.footer or DEFAULT_FOOTER,
         )
-        try:
-            await self.ctx.send.text(text, stream_id)
-        except Exception as exc:
-            self.ctx.logger.error("推送到 %s 失败: %s", stream_id, exc)
-            return False
+        for index, page in enumerate(pages, start=1):
+            if not await self._send_text(page, stream_id):
+                if index > 1:
+                    self.ctx.logger.warning(
+                        "推送到 %s 的第 %d/%d 页失败，前面已发出的页无法撤回",
+                        stream_id,
+                        index,
+                        len(pages),
+                    )
+                return False
         self._store.set_last_pushed(stream_id, issue.date)
         return True
 
@@ -479,11 +544,15 @@ class JuyaDailyPlugin(MaiBotPlugin):
     async def _wait_for_today_issue(self, today: str, due: list[str]) -> None:
         hour, minute = self._parse_hhmm(self.config.push.stale_deadline, (12, 0))
         deadline = dtime(hour, minute)
-        if datetime.now().time() >= deadline:
+
+        def _now_cst_time() -> dtime:
+            return now_cst().time()
+
+        if _now_cst_time() >= deadline:
             self.ctx.logger.warning("已过当日放弃时间 %02d:%02d，今天的早报不再推送", hour, minute)
             return
         attempt = 0
-        while datetime.now().time() < deadline:
+        while _now_cst_time() < deadline:
             await asyncio.sleep(self._WAIT_INTERVAL_SECONDS)
             attempt += 1
             try:

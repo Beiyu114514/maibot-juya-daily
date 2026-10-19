@@ -67,11 +67,25 @@ stale_deadline = "12:00"   # 当天一期超过这个时间还没发布就放弃
 - **无 SDK 定时组件**，插件用 asyncio 后台任务自建每日定时器；热重载（新建 Runner 进程）时任务随插件卸载而取消，状态由落盘保证。
 - **容错**：RSS/Atom 宽容解析 + HTML 兜底；日期优先从标题/正文抽取（pubDate 仅兜底）；推送失败按 `retry_minutes × retry_times` 重试；当天早报未发布时每 30 分钟重查，到 `stale_deadline` 放弃。
 - **风控友好**：启动补推与多群推送时各单位并发发起、各自随机延迟 30–120 秒，群多时总耗时取决于最慢一个。
+- **分页发送**：整期内容按「条」打包成多条消息，单条不超过 1800 字，避免被 QQ 截断；末页带来源脚注。
+- **链接格式兼容**：站点早期用 `/issue-N/`、现改为 `/issues/YYYY-MM-DD/`，RSS 与 HTML 兜底两种都认。
+
+## 开发
+
+```bash
+# 在 MaiBot 仓库的 plugins/ 目录下（或任意位置）跑：
+python3 -m py_compile plugins/juya-daily/*.py          # 语法检查
+python3 -m unittest discover -s tests -v               # 单元测试（83 项）
+JUYA_LIVE=1 python3 -m unittest tests.test_live_rss -v # 真实站点冒烟（默认跳过）
+```
+
+测试不依赖真实 MaiBot：缺 `pydantic` / `maibot_sdk` 时自动注入最小桩，CI 里装真包。
 
 ## 注意
 
 - `push_time` 按部署机本地时区计算；站点（东八区）一般在早上 8 点前后发布当天一期，默认 09:30 可避开空窗。
 - 站点声明资讯由 AI 辅助生成、可能存在错误，推送脚注默认保留该提示与原文链接。
+- 若站点改版导致 RSS 解析异常，可用上面的 `JUYA_LIVE=1` 冒烟最早发现；CI 每晚也会自动跑一次。
 
 ## License
 

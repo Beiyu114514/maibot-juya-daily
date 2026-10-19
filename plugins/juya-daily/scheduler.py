@@ -5,10 +5,15 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timedelta
+from typing import Callable
 
 
 class DailyScheduler:
-    """每天在 push_time 触发一次 on_fire；stop() 可随时取消。"""
+    """每天在 push_time 触发一次 on_fire；stop() 可随时取消。
+
+    ``now_fn`` 决定「现在几点」的参照系：默认宿主机本地时间，
+    插件传入东八区时钟，与站点发布时间、today_cst() 保持一致。
+    """
 
     def __init__(
         self,
@@ -16,11 +21,13 @@ class DailyScheduler:
         on_fire,  # async callable，无参数
         logger: logging.Logger,
         check_interval: float = 30.0,
+        now_fn: Callable[[], datetime] | None = None,
     ):
         self.push_time = push_time
         self.on_fire = on_fire
         self.logger = logger
         self.check_interval = check_interval
+        self._now_fn = now_fn or datetime.now
         self._stop_event = asyncio.Event()
         self._task: asyncio.Task | None = None
 
@@ -65,7 +72,7 @@ class DailyScheduler:
 
     def _next_run(self, now: datetime | None = None) -> datetime:
         hour, minute = self._parse_push_time()
-        now = now or datetime.now()
+        now = now or self._now_fn()
         target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
         if target <= now:
             target += timedelta(days=1)
@@ -78,7 +85,7 @@ class DailyScheduler:
             try:
                 # 分片睡眠：既能及时响应 stop，也不会空转
                 while not self._stop_event.is_set():
-                    remaining = (target - datetime.now()).total_seconds()
+                    remaining = (target - self._now_fn()).total_seconds()
                     if remaining <= 0:
                         break
                     timeout = min(remaining, self.check_interval)
