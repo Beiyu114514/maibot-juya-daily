@@ -21,8 +21,17 @@ admin_only = false
 
 [push]
 # 消息格式：text=纯文本；markdown=QQ Markdown（需支持 qq_markdown 自定义段的适配器，
-# 如 WhiteCloudOL/qq-official-adapter；发送失败会自动回退纯文本）
+# 如 WhiteCloudOL/qq-official-adapter）；image=整期长图（需宿主开启浏览器渲染能力）。
+# markdown / image 发送失败都会自动回退纯文本。
 message_format = "text"
+# 长图渲染宽度（CSS 像素），QQ 手机端建议 720–800
+image_width = 760
+# 长图清晰度（设备像素比），2.0 即 2 倍图
+image_scale = 2.0
+# 长图像素高度上限，超过则回退纯文本；0 表示不限制（避免超大截图导致渲染失败）
+image_max_height = 16000
+# 长图渲染超时（毫秒）
+image_timeout_ms = 30000
 # 每期最多推送的资讯条数，0 表示全部
 max_items = 0
 # 脚注模板，支持 {link} {date} {title} 占位

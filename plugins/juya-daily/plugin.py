@@ -27,6 +27,7 @@ try:  # 以包形式加载（plugins.juya_daily.plugin）
         markdown_to_plain,
         paginate_issue,
         paginate_issue_markdown,
+        render_issue_html,
     )
     from .scheduler import DailyScheduler, parse_hhmm
     from .store import Store
@@ -43,6 +44,7 @@ except ImportError:  # 以目录形式直接加载时的兜底
         markdown_to_plain,
         paginate_issue,
         paginate_issue_markdown,
+        render_issue_html,
     )
     from scheduler import DailyScheduler, parse_hhmm
     from store import Store
@@ -119,13 +121,41 @@ class PushSection(PluginConfigBase):
     __ui_icon__ = "send"
     __ui_order__ = 4
 
-    message_format: Literal["text", "markdown"] = Field(
+    message_format: Literal["text", "markdown", "image"] = Field(
         "text",
         description=(
             "消息格式：text=纯文本；markdown=QQ Markdown（需使用支持 qq_markdown "
-            "自定义段的适配器，如 WhiteCloudOL/qq-official-adapter）"
+            "自定义段的适配器，如 WhiteCloudOL/qq-official-adapter）；"
+            "image=长图（需宿主开启浏览器渲染能力）"
         ),
         json_schema_extra={"label": "消息格式"},
+    )
+    image_width: int = Field(
+        760,
+        ge=480,
+        le=1200,
+        description="长图渲染宽度（CSS 像素），QQ 手机端建议 720–800",
+        json_schema_extra={"label": "长图宽度（px）"},
+    )
+    image_scale: float = Field(
+        2.0,
+        ge=1.0,
+        le=3.0,
+        description="长图渲染清晰度（设备像素比），2.0 即 2 倍图",
+        json_schema_extra={"label": "长图清晰度"},
+    )
+    image_max_height: int = Field(
+        16000,
+        ge=0,
+        description="长图像素高度上限，超过则回退纯文本；0 表示不限制",
+        json_schema_extra={"label": "长图最大高度（px）"},
+    )
+    image_timeout_ms: int = Field(
+        30000,
+        ge=3000,
+        le=120000,
+        description="长图渲染超时（毫秒）",
+        json_schema_extra={"label": "长图渲染超时（ms）"},
     )
     max_items: int = Field(
         0,
@@ -293,6 +323,12 @@ class JuyaDailyPlugin(MaiBotPlugin):
             return (False, "no issue", 2)
         self._store.set_last_fetch(issue.to_dict())
         stale = issue.date != today_cst()
+        if self._message_format() == "image":
+            if stream_id:
+                await self._send_image_issue(issue, stream_id, stale=stale)
+            else:
+                self.ctx.logger.warning("/早报 缺少 stream_id，无法推送长图")
+            return (True, "ok", 2)
         message_format, pages = self._render_pages(issue, stale=stale)
         if stream_id:
             for page in pages:
@@ -501,9 +537,13 @@ class JuyaDailyPlugin(MaiBotPlugin):
                 targets.append(stream_id)
         return targets
 
+    def _message_format(self) -> str:
+        """当前配置的消息格式（text / markdown / image）。"""
+        return str(self.config.push.message_format or "text").strip().lower()
+
     def _render_pages(self, issue: Issue, stale: bool = False) -> tuple[str, list[str]]:
-        """按 ``push.message_format`` 渲染分页消息，返回 (格式, 页列表)。"""
-        message_format = str(self.config.push.message_format or "text").strip().lower()
+        """按 ``push.message_format`` 渲染文本分页，返回 (格式, 页列表)。"""
+        message_format = self._message_format()
         max_items = int(self.config.push.max_items or 0)
         footer_template = self.config.push.footer or DEFAULT_FOOTER
         if message_format == "markdown":
@@ -554,6 +594,99 @@ class JuyaDailyPlugin(MaiBotPlugin):
         self.ctx.logger.warning("Markdown 发送失败，回退纯文本：%s", stream_id)
         return await self._send_text(markdown_to_plain(page), stream_id)
 
+    async def _render_html_png(self, html_text: str) -> str:
+        """调用宿主浏览器渲染能力，把整篇 HTML 截成一张长图的 base64。
+
+        宿主 ``render.html2png`` 默认返回
+        ``{"image_base64", "mime_type", "width", "height", "render_ms"}``；
+        能力被禁用、Playwright 缺失或超时都会抛异常，这里统一降级。
+        """
+        try:
+            result = await self.ctx.render.html2png(
+                html_text,
+                selector="body",
+                viewport={"width": int(self.config.push.image_width or 760), "height": 800},
+                device_scale_factor=float(self.config.push.image_scale or 2.0),
+                full_page=True,
+                render_timeout_ms=int(self.config.push.image_timeout_ms or 30000),
+            )
+        except Exception as exc:
+            self.ctx.logger.error("长图渲染失败: %s", exc)
+            return ""
+        if not isinstance(result, dict):
+            self.ctx.logger.error("长图渲染返回异常: %r", result)
+            return ""
+        image_base64 = str(result.get("image_base64") or "")
+        if not image_base64:
+            self.ctx.logger.error("长图渲染未返回图片: %r", result)
+            return ""
+        try:
+            height = int(result.get("height") or 0)
+        except (TypeError, ValueError):
+            height = 0
+        max_height = int(self.config.push.image_max_height or 0)
+        if max_height and height > max_height:
+            self.ctx.logger.error(
+                "长图高度 %d 超过上限 %d，回退纯文本", height, max_height
+            )
+            return ""
+        self.ctx.logger.info(
+            "长图渲染完成：%dx%d，%s ms",
+            int(result.get("width") or 0),
+            height,
+            int(result.get("render_ms") or 0),
+        )
+        return image_base64
+
+    async def _send_image(self, image_base64: str, stream_id: str) -> bool:
+        """发送一张 base64 图片，严格判定 ``send.image`` 结果。"""
+        try:
+            result = await self.ctx.send.image(
+                image_base64, str(stream_id), return_details=True
+            )
+        except Exception as exc:
+            self.ctx.logger.error("长图推送到 %s 失败: %s", stream_id, exc)
+            return False
+        if isinstance(result, dict):
+            sent = bool(result.get("sent"))
+            if not sent:
+                self.ctx.logger.error("长图推送到 %s 失败: %r", stream_id, result)
+            return sent
+        return bool(result)
+
+    def _text_pages(self, issue: Issue, stale: bool = False) -> list[str]:
+        """长图失败时回退用的纯文本分页（与 ``message_format="text"`` 同源）。"""
+        return paginate_issue(
+            issue,
+            max_items=int(self.config.push.max_items or 0),
+            footer_template=self.config.push.footer or DEFAULT_FOOTER,
+            stale=stale,
+        )
+
+    async def _send_image_issue(self, issue: Issue, stream_id: str, stale: bool = False) -> bool:
+        """渲染整期长图并发送；渲染或发送失败时整期回退纯文本。
+
+        供 ``/早报`` 手动命令使用，不写推送进度；定时推送与补推走
+        :meth:`_push_image_issue`，回退文本时会逐页续传。
+        """
+        max_items = int(self.config.push.max_items or 0)
+        footer_template = self.config.push.footer or DEFAULT_FOOTER
+        html_text = render_issue_html(
+            issue,
+            max_items=max_items,
+            footer_template=footer_template,
+            stale=stale,
+            width=int(self.config.push.image_width or 760),
+        )
+        image_base64 = await self._render_html_png(html_text)
+        if image_base64 and await self._send_image(image_base64, stream_id):
+            return True
+        self.ctx.logger.warning("长图推送失败，回退纯文本：%s", stream_id)
+        for page in self._text_pages(issue, stale=stale):
+            if not await self._send_text(page, stream_id):
+                return False
+        return True
+
     async def _send_text(self, text: str, stream_id: str) -> bool:
         """发送文本并严格判定结果。
 
@@ -575,6 +708,66 @@ class JuyaDailyPlugin(MaiBotPlugin):
             self.ctx.logger.error("推送到 %s 失败: 能力返回 %r", stream_id, result)
         return bool(result)
 
+    async def _push_pages(
+        self,
+        stream_id: str,
+        issue: Issue,
+        pages: list[str],
+        message_format: str,
+        start: int = 0,
+    ) -> bool:
+        """按页发送并逐页落进度；失败时进度停在失败页，重试从该页续传。"""
+        if start >= len(pages):
+            start = 0  # 内容改版后页数变少，从头再发
+        for index in range(start, len(pages)):
+            if not await self._send_page(pages[index], stream_id, message_format):
+                if index > 0:
+                    self.ctx.logger.warning(
+                        "推送到 %s 的第 %d/%d 页失败，已发出的页无法撤回，重试将从该页继续",
+                        stream_id,
+                        index + 1,
+                        len(pages),
+                    )
+                return False  # 进度停在 index
+            self._store.set_push_progress(
+                stream_id,
+                issue.date,
+                page=index + 1,
+                done=(index + 1 == len(pages)),
+            )
+        return True
+
+    async def _push_image_issue(self, stream_id: str, issue: Issue, state: dict) -> bool:
+        """长图模式推送：整期一张；渲染/发送失败时回退文本分页并支持断点续传。
+
+        回退开始后 ``push_progress.page`` 会按已发出的文本页推进（> 0），
+        重试时据此判断「已经进入回退」，跳过长图渲染、只补剩余页，
+        避免每轮重渲染并从第 1 页重发造成刷屏。
+        """
+        pages = self._text_pages(issue)
+        if state["date"] == issue.date and state["page"] > 0:
+            start = state["page"]
+            self.ctx.logger.warning(
+                "检测到 %s 已回退纯文本（已发 %d/%d 页），本次跳过渲染，续发剩余页",
+                stream_id,
+                min(start, len(pages)),
+                len(pages),
+            )
+            return await self._push_pages(stream_id, issue, pages, "text", start=start)
+        html_text = render_issue_html(
+            issue,
+            max_items=int(self.config.push.max_items or 0),
+            footer_template=self.config.push.footer or DEFAULT_FOOTER,
+            stale=False,
+            width=int(self.config.push.image_width or 760),
+        )
+        image_base64 = await self._render_html_png(html_text)
+        if image_base64 and await self._send_image(image_base64, stream_id):
+            self._store.set_push_progress(stream_id, issue.date, page=1, done=True)
+            return True
+        self.ctx.logger.warning("长图推送失败，回退纯文本：%s", stream_id)
+        return await self._push_pages(stream_id, issue, pages, "text")
+
     async def _push_one(self, stream_id: str, issue: Issue) -> bool:
         """推送一期早报（自动分页）；按页记录进度，失败后从断点续传。"""
         pushing = self.__dict__.setdefault("_pushing", set())
@@ -586,27 +779,13 @@ class JuyaDailyPlugin(MaiBotPlugin):
             state = self._store.push_state(stream_id)
             if state["date"] == issue.date and state["done"]:
                 return True
+            if self._message_format() == "image":
+                return await self._push_image_issue(stream_id, issue, state)
             message_format, pages = self._render_pages(issue)
             start = state["page"] if state["date"] == issue.date else 0
-            if start >= len(pages):
-                start = 0  # 内容改版后页数变少，从头再发
-            for index in range(start, len(pages)):
-                if not await self._send_page(pages[index], stream_id, message_format):
-                    if index > 0:
-                        self.ctx.logger.warning(
-                            "推送到 %s 的第 %d/%d 页失败，已发出的页无法撤回，重试将从该页继续",
-                            stream_id,
-                            index + 1,
-                            len(pages),
-                        )
-                    return False  # 进度停在 index
-                self._store.set_push_progress(
-                    stream_id,
-                    issue.date,
-                    page=index + 1,
-                    done=(index + 1 == len(pages)),
-                )
-            return True
+            return await self._push_pages(
+                stream_id, issue, pages, message_format, start=start
+            )
         finally:
             pushing.discard(stream_id)
 

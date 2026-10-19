@@ -17,6 +17,7 @@ from formatter import (  # noqa: E402
     markdown_to_plain,
     paginate_issue,
     paginate_issue_markdown,
+    render_issue_html,
     split_issue,
     split_items,
 )
@@ -409,6 +410,39 @@ class MarkdownFormatterTest(unittest.TestCase):
     def test_markdown_limit_leaves_room_for_adapter_cap(self) -> None:
         self.assertEqual(MARKDOWN_CHAR_LIMIT, 3800)
         self.assertLess(MARKDOWN_CHAR_LIMIT, 4000)  # qq-official-adapter 的硬上限
+
+
+class ImageHtmlTest(unittest.TestCase):
+    """长图 HTML：自包含、转义、宽度与结构正确。"""
+
+    def test_render_issue_html_structure(self) -> None:
+        html = render_issue_html(make_issue(REAL_SHAPED_BODY))
+        self.assertTrue(html.startswith("<!DOCTYPE html>"))
+        self.assertIn("橘鸦AI早报 #123", html)
+        self.assertIn("某模型发布新版本 #1", html)
+        self.assertIn('class="item-title"', html)
+        self.assertIn('class="item-body"', html)
+        self.assertIn("来源：橘鸦AI早报", html)
+        self.assertIn("width:760px", html)
+        # 不引用外部资源，浏览器无需联网
+        self.assertNotIn("<script", html)
+        self.assertNotIn("http://", html)
+        self.assertNotIn("<link", html)
+        self.assertNotIn("<img", html)
+
+    def test_render_issue_html_escapes_markup(self) -> None:
+        issue = make_issue("<script>alert(1)</script> & 标题 #1\n正文 <b>加粗</b>")
+        html = render_issue_html(issue)
+        self.assertNotIn("<script>alert(1)</script>", html)
+        self.assertIn("&lt;script&gt;", html)
+        self.assertIn("&amp;", html)
+        self.assertIn("&lt;b&gt;", html)
+
+    def test_render_issue_html_stale_and_max_items(self) -> None:
+        html = render_issue_html(make_issue(), max_items=1, stale=True, width=720)
+        self.assertIn("暂未抓到今天的一期", html)
+        self.assertIn("仅展示前 1 条", html)
+        self.assertIn("width:720px", html)
 
 
 if __name__ == "__main__":

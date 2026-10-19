@@ -204,14 +204,17 @@ class FakeSend:
         raise_streams=(),
         fail_pages=(),
         fail_markdown=False,
+        fail_image=False,
     ):
         self.fail_streams = set(fail_streams)
         self.raise_streams = set(raise_streams)
         self.fail_pages = set(fail_pages)  # 第几页失败（1 起）
         self.fail_markdown = fail_markdown  # 只让 custom（Markdown）失败
+        self.fail_image = fail_image  # 只让 image（长图）失败
         self.calls: list[tuple[str, str]] = []
         self.custom_calls: list[tuple[str, str, dict]] = []
         self.custom_kwargs: list[dict] = []
+        self.image_calls: list[tuple[str, str]] = []
 
     async def text(self, text, stream_id, *, return_details=False, **_kwargs):
         index = len([c for c in self.calls if c[0] == stream_id]) + 1
@@ -232,6 +235,38 @@ class FakeSend:
             return {"sent": False, "message_id": None} if return_details else False
         return {"sent": True, "message_id": f"c{len(self.custom_calls)}"} if return_details else True
 
+    async def image(self, image_data, stream_id, *, return_details=False, **_kwargs):
+        self.image_calls.append((str(stream_id), str(image_data)))
+        if stream_id in self.raise_streams:
+            raise RuntimeError("发送通道炸了")
+        if stream_id in self.fail_streams or self.fail_image:
+            return {"sent": False, "message_id": None} if return_details else False
+        return {"sent": True, "message_id": f"i{len(self.image_calls)}"} if return_details else True
+
+
+class FakeRender:
+    """模拟宿主 render.html2png：默认返回一张 1520x1200 的 PNG base64。"""
+
+    def __init__(self, image_base64="aW1n", height=1200, fail=False):
+        self.image_base64 = image_base64
+        self.height = height
+        self.fail = fail
+        self.calls: list[dict] = []
+
+    async def html2png(self, html, **kwargs):
+        self.calls.append({"html": html, **kwargs})
+        if self.fail:
+            raise RuntimeError("浏览器渲染能力已禁用")
+        if self.image_base64 is None:
+            return {"success": False, "error": "渲染失败"}
+        return {
+            "image_base64": self.image_base64,
+            "mime_type": "image/png",
+            "width": 1520,
+            "height": self.height,
+            "render_ms": 42,
+        }
+
 
 class FakeChat:
     def __init__(self, streams=None):
@@ -249,10 +284,11 @@ class FakePaths:
 
 
 class FakeCtx:
-    def __init__(self, data_dir: str, send=None, chat=None):
+    def __init__(self, data_dir: str, send=None, chat=None, render=None):
         self.paths = FakePaths(data_dir)
         self.send = send or FakeSend()
         self.chat = chat if chat is not None else FakeChat()
+        self.render = render if render is not None else FakeRender()
         self.logger = LOGGER
 
 
@@ -281,10 +317,14 @@ def wire(plugin, ctx, config) -> None:
         plugin.config = config
 
 
-def build_plugin(tmp: str, send=None, chat=None, **config_fields) -> JuyaDailyPlugin:
+def build_plugin(tmp: str, send=None, chat=None, render=None, **config_fields) -> JuyaDailyPlugin:
     """绕过 on_load 直接装配，避免测试里起真实定时器和网络请求。"""
     plugin = create_plugin()
-    wire(plugin, FakeCtx(tmp, send=send, chat=chat), JuyaDailyConfig(**config_fields))
+    wire(
+        plugin,
+        FakeCtx(tmp, send=send, chat=chat, render=render),
+        JuyaDailyConfig(**config_fields),
+    )
     plugin._tasks = set()
     plugin._static_stream_ids = {}
     plugin._store = Store(os.path.join(tmp, "state.json"))
@@ -370,6 +410,9 @@ class EntryPointTest(unittest.TestCase):
         self.assertIn("send.text", manifest["capabilities"])
         # Markdown 模式走结构化自定义消息，manifest 必须显式申请该能力
         self.assertIn("send.custom", manifest["capabilities"])
+        # 长图模式走宿主浏览器渲染 + 图片发送
+        self.assertIn("send.image", manifest["capabilities"])
+        self.assertIn("render.html2png", manifest["capabilities"])
         config = JuyaDailyConfig()
         self.assertIsInstance(config.plugin.config_version, str)
         self.assertTrue(config.plugin.config_version)
@@ -473,6 +516,10 @@ class ConfigModelTest(unittest.TestCase):
         self.assertEqual(cfg.schedule.push_time, "09:30")
         self.assertEqual(cfg.push.max_items, 0)
         self.assertEqual(cfg.push.message_format, "text")
+        self.assertEqual(cfg.push.image_width, 760)
+        self.assertEqual(cfg.push.image_scale, 2.0)
+        self.assertEqual(cfg.push.image_max_height, 16000)
+        self.assertEqual(cfg.push.image_timeout_ms, 30000)
         self.assertEqual(cfg.push.stagger_min_seconds, 30)
         self.assertEqual(cfg.push.stagger_max_seconds, 120)
 
@@ -745,6 +792,158 @@ class MarkdownPushTest(unittest.TestCase):
             self.assertTrue(await plugin._push_one("s1", make_issue("2026-10-19")))
             self.assertEqual(send.custom_calls, [])
             self.assertGreaterEqual(len(send.calls), 1)
+
+        asyncio.run(scenario())
+
+
+class ImagePushTest(unittest.TestCase):
+    """长图模式：render.html2png 截图 + send.image 发送，失败回退纯文本。"""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp()
+
+    def _image_plugin(self, send=None, render=None):
+        return build_plugin(
+            self.tmp,
+            send=send,
+            render=render,
+            push={"message_format": "image"},
+        )
+
+    def test_image_mode_renders_and_sends_single_image(self) -> None:
+        async def scenario() -> None:
+            send = FakeSend()
+            render = FakeRender()
+            plugin = self._image_plugin(send, render)
+            plugin._store.subscribe("s1", "10001")
+            self.assertTrue(await plugin._push_one("s1", make_issue("2026-10-19")))
+
+            self.assertEqual(len(render.calls), 1)
+            call = render.calls[0]
+            self.assertTrue(call["html"].startswith("<!DOCTYPE html>"))
+            self.assertIn("橘鸦AI早报", call["html"])
+            self.assertEqual(call["selector"], "body")
+            self.assertTrue(call["full_page"])
+            self.assertEqual(call["viewport"]["width"], 760)
+            self.assertEqual(call["device_scale_factor"], 2.0)
+
+            self.assertEqual(send.calls, [])  # 没有走纯文本
+            self.assertEqual(send.custom_calls, [])  # 也没有走 Markdown
+            self.assertEqual(len(send.image_calls), 1)
+            stream_id, image_data = send.image_calls[0]
+            self.assertEqual(stream_id, "s1")
+            self.assertEqual(image_data, "aW1n")
+            self.assertTrue(plugin._store.push_state("s1")["done"])
+            self.assertEqual(plugin._store.last_pushed_date("s1"), "2026-10-19")
+
+        asyncio.run(scenario())
+
+    def test_render_exception_falls_back_to_text(self) -> None:
+        async def scenario() -> None:
+            send = FakeSend()
+            plugin = self._image_plugin(send, FakeRender(fail=True))
+            plugin._store.subscribe("s1", "10001")
+            self.assertTrue(await plugin._push_one("s1", make_issue("2026-10-19")))
+            self.assertEqual(send.image_calls, [])
+            self.assertGreaterEqual(len(send.calls), 1)
+            self.assertIn("📰", send.calls[0][1])
+
+        asyncio.run(scenario())
+
+    def test_render_error_payload_falls_back_to_text(self) -> None:
+        async def scenario() -> None:
+            send = FakeSend()
+            plugin = self._image_plugin(send, FakeRender(image_base64=None))
+            plugin._store.subscribe("s1", "10001")
+            self.assertTrue(await plugin._push_one("s1", make_issue("2026-10-19")))
+            self.assertEqual(send.image_calls, [])
+            self.assertGreaterEqual(len(send.calls), 1)
+
+        asyncio.run(scenario())
+
+    def test_image_send_failure_falls_back_to_text(self) -> None:
+        async def scenario() -> None:
+            send = FakeSend(fail_image=True)
+            plugin = self._image_plugin(send, FakeRender())
+            plugin._store.subscribe("s1", "10001")
+            self.assertTrue(await plugin._push_one("s1", make_issue("2026-10-19")))
+            self.assertEqual(len(send.image_calls), 1)
+            self.assertGreaterEqual(len(send.calls), 1)
+            self.assertIn("📰", send.calls[0][1])
+
+        asyncio.run(scenario())
+
+    def test_too_tall_image_falls_back_without_sending(self) -> None:
+        async def scenario() -> None:
+            send = FakeSend()
+            render = FakeRender(height=20000)
+            plugin = self._image_plugin(send, render)
+            plugin._store.subscribe("s1", "10001")
+            self.assertTrue(await plugin._push_one("s1", make_issue("2026-10-19")))
+            self.assertEqual(send.image_calls, [])
+            self.assertGreaterEqual(len(send.calls), 1)
+
+        asyncio.run(scenario())
+
+    def test_fallback_text_records_progress_and_resumes_remaining_pages(self) -> None:
+        """长图回退文本后失败：进度按页落盘，重试跳过长图、只补剩余页。"""
+
+        async def scenario() -> None:
+            send = FakeSend(fail_image=True, fail_pages={2})
+            render = FakeRender()
+            plugin = self._image_plugin(send, render)
+            plugin._store.subscribe("s1", "10001")
+            issue = make_long_issue("2026-10-19")
+            pages = plugin_module.paginate_issue(issue)
+            self.assertGreaterEqual(len(pages), 3)
+
+            self.assertFalse(await plugin._push_one("s1", issue))
+            self.assertEqual(len(render.calls), 1)  # 长图只渲染一次
+            self.assertEqual(len(send.image_calls), 1)  # 长图尝试过并失败
+            self.assertEqual(len(send.calls), 2)  # 文本第 1 页成功、第 2 页失败
+            state = plugin._store.push_state("s1")
+            self.assertEqual(state["date"], "2026-10-19")
+            self.assertEqual(state["page"], 1)
+            self.assertFalse(state["done"])
+
+            send.fail_pages.clear()
+            before = len(send.calls)
+            self.assertTrue(await plugin._push_one("s1", issue))
+            self.assertEqual(len(render.calls), 1)  # 重试不再渲染长图
+            self.assertEqual(len(send.calls) - before, len(pages) - 1)  # 只补剩余页
+            self.assertTrue(plugin._store.push_state("s1")["done"])
+            self.assertEqual(plugin._store.last_pushed_date("s1"), "2026-10-19")
+
+        asyncio.run(scenario())
+
+    def test_fallback_resume_skips_render_when_progress_exists(self) -> None:
+        """进度显示已进入文本回退时，重试直接续发，不再渲染/发送长图。"""
+
+        async def scenario() -> None:
+            send = FakeSend()
+            render = FakeRender()
+            plugin = self._image_plugin(send, render)
+            plugin._store.subscribe("s1", "10001")
+            issue = make_long_issue("2026-10-19")
+            pages = plugin_module.paginate_issue(issue)
+            plugin._store.set_push_progress("s1", "2026-10-19", page=1, done=False)
+
+            self.assertTrue(await plugin._push_one("s1", issue))
+            self.assertEqual(render.calls, [])
+            self.assertEqual(send.image_calls, [])
+            self.assertEqual(len(send.calls), len(pages) - 1)
+            self.assertTrue(plugin._store.push_state("s1")["done"])
+
+        asyncio.run(scenario())
+
+    def test_text_mode_never_renders(self) -> None:
+        async def scenario() -> None:
+            render = FakeRender()
+            plugin = build_plugin(self.tmp, render=render)
+            plugin._store.subscribe("s1", "10001")
+            self.assertTrue(await plugin._push_one("s1", make_issue("2026-10-19")))
+            self.assertEqual(render.calls, [])
+            self.assertGreaterEqual(len(plugin.ctx.send.calls), 1)
 
         asyncio.run(scenario())
 

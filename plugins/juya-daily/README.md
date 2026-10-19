@@ -1,6 +1,6 @@
 # 橘鸦AI早报（juya-daily）
 
-MaiBot 插件：订阅 [橘鸦AI早报](https://daily.juya.uk/)，每天定时把最新一期 AI 资讯推送到订阅的群/会话（默认纯文本，可选 QQ Markdown），也支持 `/早报` 随时查看。
+MaiBot 插件：订阅 [橘鸦AI早报](https://daily.juya.uk/)，每天定时把最新一期 AI 资讯推送到订阅的群/会话（默认纯文本，可选 QQ Markdown / 长图），也支持 `/早报` 随时查看。
 
 数据源为站点官方 RSS `https://daily.juya.uk/rss.xml`（每期全文内嵌），HTML 解析仅作兜底。
 
@@ -39,7 +39,7 @@ MaiBot 插件：订阅 [橘鸦AI早报](https://daily.juya.uk/)，每天定时�
 | `/早报退订` | 取消订阅（当前会话） |
 | `/早报状态` | 查看订阅状态、推送时间与最近一期 |
 
-推送内容为日期标题 + 编号条目 + 脚注（含原文链接与「AI 辅助生成，可能存在错误」提示）。默认是纯文本；把 `[push] message_format` 设为 `"markdown"` 后改为 QQ Markdown（标题、加粗、可点击原文链接，单条上限 3800 字）。
+推送内容为日期标题 + 编号条目 + 脚注（含原文链接与「AI 辅助生成，可能存在错误」提示）。默认是纯文本；把 `[push] message_format` 设为 `"markdown"` 后改为 QQ Markdown（标题、加粗、可点击原文链接，单条上限 3800 字），设为 `"image"` 后改为整期长图。
 
 ## QQ Markdown 推送
 
@@ -55,6 +55,24 @@ message_format = "markdown"
 - 只使用 QQ 官方 Markdown 支持的语法（`#`/`##` 标题、`**加粗**`、`>` 引用、`[文字](url)` 链接），不使用代码块与表格。
 - 其他适配器（如 NapCat/SnowLuma 统一连接器）没有 `qq_markdown` 段，会把它当未知段降级成 `[unsupported:qq_markdown]` 文本；这类环境请保持默认 `message_format = "text"`。
 
+## 长图推送
+
+`message_format = "image"` 会把整期渲染成一张竖版长图（标题、导语、条目、脚注），通过宿主 `render.html2png` 截图后用 `send.image` 发出。图片走 QQ 富媒体（`msg_type=7`），QQ 官方机器人和 NapCat/SnowLuma 等本地客户端路线都能正常显示。
+
+```toml
+[push]
+message_format = "image"
+image_width = 760         # 长图宽度（CSS 像素）
+image_scale = 2.0         # 清晰度（设备像素比）
+image_max_height = 16000  # 像素高度上限，超过则回退纯文本
+image_timeout_ms = 30000  # 渲染超时
+```
+
+- 需要宿主开启浏览器渲染：MaiBot 配置 `plugin_runtime.render.enabled = true`（默认开启），并确保 Playwright/Chromium 可用。
+- 渲染不可用、截图失败、图片发送失败或高度超限时，整期自动回退纯文本，不会让推送彻底失败；回退后按文本页记录进度，重试只补剩余页。
+- 长图模式按「整期一张」记录推送进度，失败重试会重发整张图；一旦已回退纯文本并发出部分页，重试会跳过长图渲染，只续发剩余文本页（不会每轮重新渲染并从第 1 页刷屏）。
+- HTML 使用系统字体栈（Noto Sans CJK / 苹方 / 微软雅黑等），不加载任何外部资源，离线也能渲染。
+
 ## 配置（config.toml）
 
 ```toml
@@ -68,7 +86,11 @@ static_platform = "qq"
 admin_only = false         # 仅管理员可订阅/退订
 
 [push]
-message_format = "text"    # text=纯文本；markdown=QQ Markdown（需适配器支持 qq_markdown 段）
+message_format = "text"    # text=纯文本；markdown=QQ Markdown；image=长图
+image_width = 760          # 长图宽度（CSS 像素）
+image_scale = 2.0          # 长图清晰度（设备像素比）
+image_max_height = 16000   # 长图像素高度上限，超过回退纯文本
+image_timeout_ms = 30000   # 长图渲染超时（毫秒）
 max_items = 0              # 每期最多推几条，0 = 全部
 footer = "…"               # 脚注模板，支持 {link} {date} {title}
 retry_minutes = 10         # 推送失败重试间隔
@@ -86,7 +108,7 @@ stale_deadline = "12:00"   # 当天一期超过这个时间还没发布就放弃
 - **无 SDK 定时组件**，插件用 asyncio 后台任务自建每日定时器；热重载（新建 Runner 进程）时任务随插件卸载而取消，状态由落盘保证。
 - **容错**：RSS/Atom 宽容解析 + HTML 兜底；日期优先从标题/正文抽取（pubDate 仅兜底）；推送失败按 `retry_minutes × retry_times` 重试；当天早报未发布时每 30 分钟重查，到 `stale_deadline` 放弃。
 - **风控友好**：启动补推与多群推送并发发起，各目标随机错峰 30–120 秒（`stagger_min_seconds` / `stagger_max_seconds`），单目标重复触发会被进程内去重。
-- **分页发送**：整期内容按「条」打包成多条消息，纯文本单条不超过 1800 字、Markdown 单条不超过 3800 字，避免被 QQ 截断；末页带来源脚注。
+- **分页发送**：整期内容按「条」打包成多条消息，纯文本单条不超过 1800 字、Markdown 单条不超过 3800 字，避免被 QQ 截断；末页带来源脚注。长图模式则整期渲染成一张图，失败回退纯文本分页，进度按页落盘、重试只补剩余页。
 - **链接格式兼容**：站点早期用 `/issue-N/`、现改为 `/issues/YYYY-MM-DD/`，RSS 与 HTML 兜底两种都认。
 
 ## 开发
@@ -94,7 +116,7 @@ stale_deadline = "12:00"   # 当天一期超过这个时间还没发布就放弃
 ```bash
 # 在 MaiBot 仓库的 plugins/ 目录下（或任意位置）跑：
 python3 -m py_compile plugins/juya-daily/*.py          # 语法检查
-python3 -m unittest discover -s tests -v               # 单元测试（145 项）
+python3 -m unittest discover -s tests -v               # 单元测试（187 项）
 JUYA_LIVE=1 python3 -m unittest tests.test_live_rss -v # 真实站点冒烟（默认跳过）
 ```
 

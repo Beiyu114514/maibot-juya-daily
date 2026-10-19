@@ -22,6 +22,7 @@ RSS 正文是站点页面转成的纯文本，结构大致是：
 
 from __future__ import annotations
 
+import html as _html
 import re
 from typing import TYPE_CHECKING
 
@@ -365,3 +366,101 @@ def markdown_to_plain(text: str) -> str:
     plain = _MARKDOWN_LINK_RE.sub(lambda match: f"{match.group(1)}（{match.group(2)}）", plain)
     plain = _MARKDOWN_BOLD_RE.sub(r"\1", plain)
     return plain
+
+
+# ---------- 长图渲染（交给宿主 render.html2png 截图） ----------
+
+IMAGE_CARD_WIDTH = 760
+_IMAGE_FONT_STACK = (
+    '"Noto Sans CJK SC","Source Han Sans SC","PingFang SC","Microsoft YaHei",'
+    '"WenQuanYi Micro Hei",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif'
+)
+_IMAGE_CSS = """
+:root{color-scheme:light only;}
+*{box-sizing:border-box;}
+html,body{margin:0;padding:0;background:#eef1f7;scrollbar-width:none;-ms-overflow-style:none;}
+body::-webkit-scrollbar{display:none;width:0;height:0;}
+body{width:__WIDTH__px;font-family:__FONT__;color:#1b2330;-webkit-font-smoothing:antialiased;}
+.card{width:__WIDTH__px;padding:26px 24px 24px;background:linear-gradient(180deg,#eef3fc 0%,#e9eef8 100%);}
+.panel{background:#fff;border-radius:22px;padding:34px 32px 28px;box-shadow:0 12px 30px rgba(23,43,77,.08);}
+.brand{display:flex;align-items:center;gap:9px;font-size:13px;letter-spacing:.14em;color:#64749a;text-transform:uppercase;}
+.dot{width:9px;height:9px;border-radius:50%;background:#4f7cff;box-shadow:0 0 0 4px rgba(79,124,255,.14);}
+h1{font-size:29px;line-height:1.4;font-weight:800;letter-spacing:-.01em;margin:14px 0 8px;color:#101b31;overflow-wrap:anywhere;}
+.date{font-size:13px;color:#8492a8;margin:0 0 22px;}
+.notice{font-size:13.5px;line-height:1.75;color:#8a5b12;background:#fff7e6;border:1px solid #ffe3ad;border-radius:12px;padding:10px 14px;margin:0 0 18px;white-space:pre-wrap;}
+.intro{font-size:15px;line-height:1.85;color:#39445a;background:#f5f8ff;border-left:4px solid #4f7cff;border-radius:0 12px 12px 0;padding:14px 16px;margin:0 0 22px;white-space:pre-wrap;overflow-wrap:anywhere;}
+.item{padding:20px 0;border-top:1px solid #edf0f6;}
+.item:first-of-type{border-top:none;padding-top:4px;}
+.item-title{font-size:18.5px;line-height:1.55;font-weight:700;color:#16233c;margin:0 0 10px;overflow-wrap:anywhere;}
+.item-body{font-size:15px;line-height:1.9;color:#33405a;white-space:pre-wrap;overflow-wrap:anywhere;}
+.footer{margin-top:26px;padding-top:18px;border-top:1px dashed #dfe5f0;font-size:12.5px;line-height:1.8;color:#8a94a6;white-space:pre-wrap;overflow-wrap:anywhere;}
+"""
+
+
+def _html_block(text: str) -> str:
+    """转义一段要放进 HTML 的纯文本。"""
+    return _html.escape(text or "", quote=False)
+
+
+def render_issue_html(
+    issue: Issue,
+    max_items: int = 0,
+    footer_template: str = DEFAULT_FOOTER,
+    stale: bool = False,
+    width: int = IMAGE_CARD_WIDTH,
+) -> str:
+    """把一期渲染成自包含 HTML，供宿主 ``render.html2png`` 截成长图。
+
+    HTML 不引用任何外部资源（字体走系统字体栈，无图片/脚本），
+    因此宿主浏览器不需要联网也能渲染；返回整页供 ``full_page`` 截图。
+    """
+    title, intro, items, note, footer = _prepare_issue(issue, max_items, footer_template)
+
+    parts: list[str] = [
+        '<div class="brand"><span class="dot"></span><span>JUYA DAILY · AI 早报</span></div>',
+        f"<h1>{_html_block(title)}</h1>",
+    ]
+    if issue.date:
+        parts.append(f'<p class="date">{_html_block(issue.date)}</p>')
+    if stale:
+        parts.append(
+            '<div class="notice">暂未抓到今天的一期，以下为最近缓存：'
+            f"{_html_block(issue.date or '日期未知')}</div>"
+        )
+    if intro:
+        parts.append(f'<p class="intro">{_html_block(intro)}</p>')
+
+    for item in items:
+        head, _, body = (item or "").partition("\n")
+        head = head.strip()
+        body = body.strip()
+        if not head and not body:
+            continue
+        article = ['<article class="item">']
+        if head:
+            article.append(f'<h2 class="item-title">{_html_block(head)}</h2>')
+        if body:
+            article.append(f'<div class="item-body">{_html_block(body)}</div>')
+        article.append("</article>")
+        parts.append("".join(article))
+
+    if note:
+        parts.append(f'<div class="notice">{_html_block(note)}</div>')
+    if footer:
+        parts.append(f'<div class="footer">{_html_block(footer)}</div>')
+
+    css = (
+        _IMAGE_CSS.replace("__WIDTH__", str(int(width)))
+        .replace("__FONT__", _IMAGE_FONT_STACK)
+    )
+    return (
+        "<!DOCTYPE html>\n"
+        '<html lang="zh-CN"><head><meta charset="utf-8">'
+        f'<meta name="viewport" content="width={int(width)}">'
+        '<meta name="color-scheme" content="light only">'
+        f"<title>{_html_block(title)}</title>"
+        f"<style>{css}</style></head>"
+        '<body><main class="card"><section class="panel">'
+        + "".join(parts)
+        + "</section></main></body></html>"
+    )
