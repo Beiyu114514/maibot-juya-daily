@@ -75,7 +75,7 @@ stale_deadline = "12:00"   # 当天一期超过这个时间还没发布就放弃
 ```bash
 # 在 MaiBot 仓库的 plugins/ 目录下（或任意位置）跑：
 python3 -m py_compile plugins/juya-daily/*.py          # 语法检查
-python3 -m unittest discover -s tests -v               # 单元测试（86 项）
+python3 -m unittest discover -s tests -v               # 单元测试（91 项）
 JUYA_LIVE=1 python3 -m unittest tests.test_live_rss -v # 真实站点冒烟（默认跳过）
 ```
 

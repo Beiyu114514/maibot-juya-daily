@@ -150,6 +150,9 @@ _spec = importlib.util.spec_from_file_location(
     "juya_plugin_under_test", os.path.join(PLUGIN_DIR, "plugin.py")
 )
 plugin_module = importlib.util.module_from_spec(_spec)
+# 必须先注册进 sys.modules 再 exec：pydantic 等库解析注解时要靠
+# sys.modules[cls.__module__] 拿模块命名空间（真实 import 会自动注册）。
+sys.modules[_spec.name] = plugin_module
 _spec.loader.exec_module(plugin_module)
 
 from fetcher import Issue  # noqa: E402
@@ -377,6 +380,53 @@ class SdkContractTest(unittest.TestCase):
         plugin = create_plugin()
         with self.assertRaises(RuntimeError):
             _ = plugin.config
+
+    def test_plugin_module_registered_in_sys_modules(self) -> None:
+        # 记录加载方式的前提：pydantic 解析注解需要模块已注册
+        self.assertIn("juya_plugin_under_test", sys.modules)
+        self.assertIs(sys.modules["juya_plugin_under_test"], plugin_module)
+
+
+class ConfigModelTest(unittest.TestCase):
+    """配置模型必须在「真实 pydantic」下开箱可实例化。
+
+    回归：plugin.py 曾有 `from __future__ import annotations`，注解全变字符串，
+    加载器若没把模块注册进 sys.modules，pydantic 报
+    "JuyaDailyConfig is not fully defined; you should define PluginSection"，
+    插件在真 Runner 里根本起不来。CI 首跑就是因此 26 个 ERROR。
+    """
+
+    def test_default_instantiable(self) -> None:
+        cfg = JuyaDailyConfig()
+        self.assertTrue(cfg.plugin.enabled)
+        self.assertEqual(cfg.schedule.push_time, "09:30")
+        self.assertEqual(cfg.push.max_items, 0)
+
+    def test_instantiable_with_partial_override(self) -> None:
+        cfg = JuyaDailyConfig(schedule={"push_time": "07:15", "catch_up_on_start": False})
+        self.assertEqual(cfg.schedule.push_time, "07:15")
+        self.assertFalse(cfg.schedule.catch_up_on_start)
+
+    def test_not_pending_model_rebuild(self) -> None:
+        """真实 pydantic 下：未完全定义的模型一实例化就抛 PydanticUserError。"""
+        try:
+            JuyaDailyConfig(subscribe={"static_chats": ["123"]})
+        except Exception as exc:  # pragma: no cover - 只在回归时触发
+            self.fail(f"JuyaDailyConfig 无法实例化（注解未解析？）: {exc!r}")
+
+    def test_plugin_source_has_no_future_annotations(self) -> None:
+        with open(os.path.join(PLUGIN_DIR, "plugin.py"), encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+        offenders = [
+            f"{number}: {line}"
+            for number, line in enumerate(lines, start=1)
+            if re.match(r"^from __future__ import annotations\s*(#.*)?$", line)
+        ]
+        self.assertEqual(
+            offenders,
+            [],
+            "plugin.py 不能启用 PEP 563：配置节注解必须能被 pydantic 直接解析",
+        )
 
 
 class SubscribeCommandTest(unittest.TestCase):

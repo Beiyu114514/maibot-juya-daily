@@ -86,7 +86,7 @@ stale_deadline = "12:00"   # 当天一期超过这个时间还没发布就放弃
 # 语法检查
 python3 -m py_compile plugins/juya-daily/*.py
 
-# 单元测试（86 项：RSS 解析 / 排版分页 / 状态落盘 / 定时器 / 推送成败判定 / SDK 注入契约）
+# 单元测试（91 项：RSS 解析 / 排版分页 / 状态落盘 / 定时器 / 推送成败判定 / SDK 注入契约 / 配置模型可实例化）
 python3 -m unittest discover -s tests -v
 
 # 真实站点集成测试（会请求 daily.juya.uk，默认跳过）

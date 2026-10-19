@@ -6,7 +6,7 @@
 
 ### 新增
 
-- **单元测试套件**（`tests/`，86 项，`python3 -m unittest discover -s tests`）：
+- **单元测试套件**（`tests/`，91 项，`python3 -m unittest discover -s tests`）：
   - `test_fetcher`：RSS/Atom 宽容解析、ISO 8601 pubDate、噪音清洗、日期抽取、新旧两种 issue 链接格式
   - `test_formatter`：分条/限条数/分页不超 1800 字、脚注占位符安全替换、概览索引行与站点页脚剥离
   - `test_store`：订阅/退订、推送进度与订阅表分离、v1→v2 迁移、损坏文件备份
@@ -24,6 +24,7 @@
 - **分条前先剥离噪音**：原来只在切片后清理，分组小标题（如「要闻」）会残留在开头
 - **CI 无法启动**：`actions/setup-python` 的 `cache: pip` 让「Setup Python 3.12」这一步直接失败（v0.2.0 首跑实证：test job 从没跑起来、打包被 `needs: test` 跳过、Release 未生成）；已去掉 `cache`，依赖收敛到 `requirements-dev.txt`
 - **测试桩与真实 SDK 脱节**：桩把 `ctx`/`config` 当普通属性、`Command` 不写 `__maibot_component_info__`，本地跑过的代码 CI 里（真实 SDK）行为不同；桩改为对齐真实可见面（只读属性 + `_set_context` / `set_plugin_config` 注入），并加 `SdkContractTest` 锁死该契约
+- **配置模型在真 pydantic 下无法实例化**：`plugin.py` 启用了 `from __future__ import annotations`，所有注解变成字符串，pydantic 要靠 `sys.modules[__name__]` 才能解析 `PluginSection`/`ScheduleSection` 等配置节；加载器若用 `spec_from_file_location` 却没把模块注册进 `sys.modules`，`JuyaDailyConfig(...)` 直接抛 `PydanticUserError: not fully defined; you should define PluginSection`，插件在真 Runner 里根本起不来（CI 首跑即 26 个 ERROR）。已移除 PEP 563，并加 `ConfigModelTest` 回归
 
 ## [0.1.1] - 2026-10-19
 

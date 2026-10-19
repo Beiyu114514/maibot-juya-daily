@@ -4,7 +4,12 @@
 功能：群内自助订阅 + 每日定时推送（含启动补推、失败重试）+ /早报 即取即看。
 """
 
-from __future__ import annotations
+# 注意：不要在这里加 `from __future__ import annotations`。
+# 那会让所有注解变成字符串，pydantic 需要靠 sys.modules[__name__] 才能解析
+# 配置节（PluginSection/ScheduleSection/...）；若 Runner 用
+# spec_from_file_location 加载插件却没把模块注册进 sys.modules，
+# JuyaDailyConfig 会直接抛 "not fully defined; you should define PluginSection"。
+# 本文件要求 Python 3.12+（同 MaiBot），原生就支持 list[str] / str | None。
 
 import asyncio
 import os
