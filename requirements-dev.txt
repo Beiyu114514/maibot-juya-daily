@@ -2,5 +2,9 @@
 #
 # 跑测试不强制安装：tests/ 在 import 前会检测，缺包时自动注入最小桩。
 # 装上真包后，CI 与本地就跑的是真实 pydantic + 真实 maibot_sdk。
-pydantic>=2.0.0
-maibot-plugin-sdk>=2.0.0
+pydantic>=2.0,<3
+maibot-plugin-sdk>=2.14,<3
+
+# CI 静态检查与覆盖率门禁
+ruff>=0.6
+coverage>=7.0

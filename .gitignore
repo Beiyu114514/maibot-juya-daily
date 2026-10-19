@@ -6,7 +6,8 @@ build/
 dist/
 *.egg-info/
 
-# ---- 插件运行时状态（不应入库）----
+# ---- 插件运行时状态 / 本地调试配置（不应入库）----
+plugins/juya-daily/config.toml
 state.json
 state.json.tmp
 *.corrupt

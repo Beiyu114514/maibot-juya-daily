@@ -9,12 +9,14 @@ from __future__ import annotations
 import asyncio
 import email.utils
 import html
+import json
 import logging
 import re
 import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 RSS_URL = "https://daily.juya.uk/rss.xml"
 SITE_URL = "https://daily.juya.uk/"
@@ -22,10 +24,21 @@ SITE_URL = "https://daily.juya.uk/"
 # 站点是中文日更，日期一律按东八区归一化，避免受部署机时区影响
 CST = timezone(timedelta(hours=8))
 
-USER_AGENT = "MaiBot-juya-daily-plugin/0.1 (+https://daily.juya.uk/)"
+
+def _plugin_version() -> str:
+    """从同目录 _manifest.json 读版本，避免 User-Agent 长年停在 0.1。"""
+    try:
+        with open(Path(__file__).with_name("_manifest.json"), encoding="utf-8") as fh:
+            return str(json.load(fh).get("version") or "0.3.0")
+    except (OSError, ValueError, TypeError):
+        return "0.3.0"
+
+
+USER_AGENT = f"MaiBot-juya-daily-plugin/{_plugin_version()} (+https://daily.juya.uk/)"
 REQUEST_TIMEOUT = 15  # 秒
 MAX_RETRIES = 3
 RETRY_BACKOFF = 2  # 第 n 次重试前等待 n*RETRY_BACKOFF 秒
+MAX_RSS_BYTES = 10 * 1024 * 1024  # RSS/HTML 响应上限，防超大文件打爆内存
 
 _MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
 _TAG_RE = re.compile(r"</?[a-zA-Z][a-zA-Z0-9]*(?:\s[^>]*)?>")
@@ -91,6 +104,10 @@ class FetchError(Exception):
     """重试耗尽后仍抓取失败。"""
 
 
+class ResponseTooLarge(Exception):
+    """响应体超过 MAX_RSS_BYTES。"""
+
+
 # ---------- 网络层 ----------
 
 
@@ -103,7 +120,10 @@ def _urlopen_read(url: str) -> bytes:
         },
     )
     with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
-        return resp.read()
+        body = resp.read(MAX_RSS_BYTES + 1)
+    if len(body) > MAX_RSS_BYTES:
+        raise ResponseTooLarge(f"{url} 响应超过 {MAX_RSS_BYTES} 字节")
+    return body
 
 
 async def _http_get(url: str, logger: logging.Logger) -> bytes:
@@ -112,6 +132,10 @@ async def _http_get(url: str, logger: logging.Logger) -> bytes:
         try:
             # urlopen 是阻塞调用，丢进线程池避免卡住事件循环
             return await asyncio.to_thread(_urlopen_read, url)
+        except ResponseTooLarge as exc:
+            # 响应过大重试也没用，直接按抓取失败处理
+            logger.error("抓取 %s 失败: %s", url, exc)
+            raise FetchError(str(exc)) from exc
         except Exception as exc:
             last_err = exc
             logger.warning("抓取 %s 第 %d/%d 次失败: %s", url, attempt, MAX_RETRIES, exc)

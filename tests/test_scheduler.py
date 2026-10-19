@@ -11,10 +11,26 @@ from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "plugins", "juya-daily"))
 
-from scheduler import DailyScheduler  # noqa: E402
+from scheduler import DailyScheduler, parse_hhmm  # noqa: E402
 
 LOGGER = logging.getLogger("test-scheduler")
 LOGGER.addHandler(logging.NullHandler())
+
+
+class ParseHhmmTest(unittest.TestCase):
+    def test_valid(self) -> None:
+        self.assertEqual(parse_hhmm("07:05"), (7, 5))
+        self.assertEqual(parse_hhmm("23:59"), (23, 59))
+
+    def test_invalid_falls_back(self) -> None:
+        self.assertEqual(parse_hhmm("not-a-time", (9, 30)), (9, 30))
+        self.assertEqual(parse_hhmm("24:00", (9, 30)), (9, 30))
+        self.assertEqual(parse_hhmm("09:60", (9, 30)), (9, 30))
+
+    def test_invalid_logs_warning(self) -> None:
+        with self.assertLogs("test-scheduler", level="WARNING") as captured:
+            parse_hhmm("oops", (12, 0), LOGGER)
+        self.assertIn("回退 12:00", "\n".join(captured.output))
 
 
 class NextRunTest(unittest.TestCase):
@@ -69,6 +85,50 @@ class LifecycleTest(unittest.TestCase):
             await scheduler.stop()  # 二次停止不应抛错
 
         asyncio.run(scenario())
+
+
+class _ImmediateScheduler(DailyScheduler):
+    """把「下一次触发」固定为现在，让 _loop 不必真的等到 09:30。"""
+
+    def _next_run(self, now: datetime | None = None) -> datetime:
+        return self._now_fn()
+
+
+class LoopTest(unittest.IsolatedAsyncioTestCase):
+    async def test_loop_fires(self) -> None:
+        fired = asyncio.Event()
+        calls = {"fire": 0}
+
+        async def on_fire() -> None:
+            calls["fire"] += 1
+            fired.set()
+
+        scheduler = _ImmediateScheduler("09:30", on_fire, LOGGER, check_interval=0.01)
+        scheduler.POST_FIRE_SLEEP = 0.0  # 测试不等 61 秒
+        await scheduler.start()
+        await asyncio.wait_for(fired.wait(), timeout=2)
+        await scheduler.stop()
+        self.assertGreaterEqual(calls["fire"], 1)
+
+    async def test_callback_exception_does_not_kill_loop(self) -> None:
+        calls = {"fire": 0}
+        fired_twice = asyncio.Event()
+
+        async def on_fire() -> None:
+            calls["fire"] += 1
+            if calls["fire"] == 1:
+                raise RuntimeError("回调炸了")
+            fired_twice.set()
+
+        scheduler = _ImmediateScheduler("09:30", on_fire, LOGGER, check_interval=0.01)
+        scheduler.POST_FIRE_SLEEP = 0.0
+        with self.assertLogs(LOGGER, level="ERROR"):
+            await scheduler.start()
+            try:
+                await asyncio.wait_for(fired_twice.wait(), timeout=2)
+            finally:
+                await scheduler.stop()
+        self.assertGreaterEqual(calls["fire"], 2)
 
 
 if __name__ == "__main__":

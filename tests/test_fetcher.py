@@ -2,21 +2,38 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sys
 import unittest
 from datetime import datetime, timezone
+from unittest import mock
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "plugins", "juya-daily"))
 
+import fetcher as fetcher_module  # noqa: E402
 from fetcher import (  # noqa: E402
+    MAX_RSS_BYTES,
+    USER_AGENT,
+    FetchError,
+    Issue,
+    JuyaFetcher,
+    ResponseTooLarge,
     _ISSUE_LINK_RE,
     _extract_date,
+    _extract_page_text,
+    _http_get,
     _parse_pub_date,
+    _urlopen_read,
     clean_body,
     parse_rss,
     pick_latest,
+    today_cst,
 )
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+FIXTURES = os.path.join(HERE, "fixtures")
 
 
 def _issue_links(html: str) -> list:
@@ -152,6 +169,153 @@ class ParsePubDateTest(unittest.TestCase):
     def test_naive_datetime_treated_as_utc(self) -> None:
         parsed = _parse_pub_date("2026-06-13T00:45:53")
         self.assertIsNotNone(parsed.tzinfo)
+
+
+class _FakeResponse:
+    def __init__(self, body: bytes):
+        self.body = body
+        self.read_size: int | None = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self, size: int = -1) -> bytes:
+        self.read_size = size
+        return self.body
+
+
+class ResponseCapTest(unittest.TestCase):
+    def test_urlopen_read_caps_response(self) -> None:
+        response = _FakeResponse(b"x" * (MAX_RSS_BYTES + 1))
+        with mock.patch.object(
+            fetcher_module.urllib.request, "urlopen", return_value=response
+        ):
+            with self.assertRaises(ResponseTooLarge):
+                _urlopen_read("https://daily.juya.uk/rss.xml")
+        # 只读上限 +1 字节就够判断超限，不能把整个超大响应吞进内存
+        self.assertEqual(response.read_size, MAX_RSS_BYTES + 1)
+
+    def test_too_large_is_not_retried(self) -> None:
+        calls = {"n": 0}
+
+        def fake_read(url: str) -> bytes:
+            calls["n"] += 1
+            raise ResponseTooLarge("响应过大")
+
+        with mock.patch.object(fetcher_module, "_urlopen_read", fake_read):
+            with self.assertRaises(FetchError):
+                asyncio.run(_http_get("https://daily.juya.uk/rss.xml", LOGGER))
+        self.assertEqual(calls["n"], 1)
+
+
+class HtmlFallbackTest(unittest.TestCase):
+    def setUp(self) -> None:
+        with open(os.path.join(FIXTURES, "html_fallback.html"), encoding="utf-8") as fh:
+            self.page = fh.read()
+        self.home = (
+            '<html><body><a href="/issues/2026-10-19/">最新一期</a></body></html>'
+        ).encode("utf-8")
+
+    def test_extract_page_text_strips_chrome(self) -> None:
+        title, body = _extract_page_text(self.page)
+        self.assertEqual(title, "橘鸦AI早报 2026-10-19")
+        self.assertIn("Anthropic 设公益基金", body)
+        self.assertNotIn("站点导航", body)
+        self.assertNotIn("站点页脚", body)
+        self.assertNotIn("<p>", body)
+
+    def test_fetch_from_html(self) -> None:
+        async def fake_get(url: str, logger) -> bytes:
+            if url == fetcher_module.SITE_URL:
+                return self.home
+            return self.page.encode("utf-8")
+
+        with mock.patch.object(fetcher_module, "_http_get", fake_get):
+            issue = asyncio.run(JuyaFetcher(LOGGER)._fetch_from_html())
+        assert issue is not None
+        self.assertEqual(issue.source, "html")
+        self.assertEqual(issue.link, "https://daily.juya.uk/issues/2026-10-19/")
+        self.assertEqual(issue.date, "2026-10-19")
+        self.assertIn("要闻速览", issue.content)
+
+    def test_fetch_latest_falls_back_when_rss_fails(self) -> None:
+        async def fake_get(url: str, logger) -> bytes:
+            if url == fetcher_module.RSS_URL:
+                raise FetchError("rss down")
+            if url == fetcher_module.SITE_URL:
+                return self.home
+            return self.page.encode("utf-8")
+
+        with mock.patch.object(fetcher_module, "_http_get", fake_get):
+            issue = asyncio.run(JuyaFetcher(LOGGER).fetch_latest(force=True))
+        assert issue is not None
+        self.assertEqual(issue.source, "html")
+        self.assertEqual(issue.date, "2026-10-19")
+
+    def test_fetch_latest_falls_back_when_rss_empty(self) -> None:
+        async def fake_get(url: str, logger) -> bytes:
+            if url == fetcher_module.RSS_URL:
+                return b"<rss><channel></channel></rss>"
+            if url == fetcher_module.SITE_URL:
+                return self.home
+            return self.page.encode("utf-8")
+
+        with mock.patch.object(fetcher_module, "_http_get", fake_get):
+            issue = asyncio.run(JuyaFetcher(LOGGER).fetch_latest(force=True))
+        assert issue is not None
+        self.assertEqual(issue.source, "html")
+
+
+class CacheTest(unittest.TestCase):
+    def _cached_today(self) -> dict:
+        return Issue(
+            title="橘鸦AI早报 今日",
+            link="https://daily.juya.uk/issues/2026-10-19/",
+            date=today_cst(),
+            pub_dt=datetime.now(timezone.utc),
+            content="缓存正文",
+        ).to_dict()
+
+    def test_today_cache_skips_network(self) -> None:
+        async def boom(*args, **kwargs):
+            raise AssertionError("当日缓存命中时不应请求站点")
+
+        fetcher = JuyaFetcher(LOGGER, cache=self._cached_today())
+        with mock.patch.object(fetcher_module, "_http_get", boom):
+            issue = asyncio.run(fetcher.fetch_latest())
+        assert issue is not None
+        self.assertEqual(issue.date, today_cst())
+        self.assertEqual(issue.content, "缓存正文")
+
+    def test_force_ignores_today_cache(self) -> None:
+        calls = {"n": 0}
+
+        async def fake_get(url: str, logger) -> bytes:
+            calls["n"] += 1
+            return RSS_XML.encode("utf-8")
+
+        fetcher = JuyaFetcher(LOGGER, cache=self._cached_today())
+        with mock.patch.object(fetcher_module, "_http_get", fake_get):
+            issue = asyncio.run(fetcher.fetch_latest(force=True))
+        assert issue is not None
+        self.assertEqual(calls["n"], 1)
+        self.assertEqual(issue.title, "橘鸦AI早报 #200")
+
+
+class UserAgentTest(unittest.TestCase):
+    def test_user_agent_uses_manifest_version(self) -> None:
+        import json
+
+        manifest_path = os.path.join(
+            HERE, "..", "plugins", "juya-daily", "_manifest.json"
+        )
+        with open(os.path.abspath(manifest_path), encoding="utf-8") as fh:
+            version = json.load(fh)["version"]
+        self.assertIn(version, USER_AGENT)
+        self.assertTrue(USER_AGENT.startswith("MaiBot-juya-daily-plugin/"))
 
 
 if __name__ == "__main__":

@@ -10,13 +10,22 @@ on:
   schedule:
     - cron: "0 22 * * *"  # 每天 22:00（UTC）跑一次真实站点集成测试
 
+# 最小权限：默认只读，写权限按 job 单独授予（PR 触发的 test 不应有写权限）
 permissions:
-  contents: write         # 创建 Release 需要写权限
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
     name: 单元测试（真实 SDK）
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write       # 夜间 live 失败时自动开 issue
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -38,21 +47,39 @@ jobs:
       - name: Syntax check
         run: python -m py_compile plugins/juya-daily/*.py
 
-      - name: Unit tests
-        run: python -m unittest discover -s tests -v
+      - name: Lint（只查未定义名/语法类硬错误）
+        run: ruff check plugins/juya-daily tests --select E9,F63,F7,F82
+
+      - name: Unit tests + coverage
+        run: |
+          coverage run -m unittest discover -s tests -v
+          coverage report --fail-under=80
 
       - name: Live RSS smoke（仅定时触发，避免 PR 受站点波动影响）
+        id: live
         if: github.event_name == 'schedule'
         env:
           JUYA_LIVE: "1"
         run: python -m unittest tests.test_live_rss -v
         continue-on-error: true
 
+      - name: Open issue when nightly live smoke fails
+        if: steps.live.outcome == 'failure' && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create \
+            --title "夜间真实站点测试失败 $(date -u +%F)" \
+            --body "定时任务 \`${{ github.workflow }}\` 的真实站点冒烟失败，可能站点改版或网络异常。请查看 [运行日志](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})。"
+
   package:
     name: 打包并发布 Release
     needs: test
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write     # 创建 Release 需要写权限
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -63,6 +90,15 @@ jobs:
           test -f plugins/juya-daily/_manifest.json
           echo "--- manifest ---"
           cat plugins/juya-daily/_manifest.json
+
+      - name: Verify tag matches manifest version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          VERSION="$(python -c "import json; print(json.load(open('plugins/juya-daily/_manifest.json'))['version'])")"
+          if [ "v${VERSION}" != "${GITHUB_REF_NAME}" ]; then
+            echo "tag ${GITHUB_REF_NAME} 与 manifest 版本 v${VERSION} 不一致，拒绝打包"
+            exit 1
+          fi
 
       - name: Syntax check (py3.12, 同 MaiBot 要求)
         uses: actions/setup-python@v5

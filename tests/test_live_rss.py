@@ -40,18 +40,18 @@ class LiveRssTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(pages)
         for page in pages:
             self.assertLessEqual(len(page), MESSAGE_CHAR_LIMIT)
+            self.assertTrue(page.strip(), "每一页都应有内容")
+        self.assertIn("📰", pages[0], "首页应带标题")
         self.assertIn("https://daily.juya.uk/", pages[-1])
         self.assertNotIn("↗", "\n".join(pages))  # 概览索引行已剥离
-        self.assertNotIn("AI辅助创作", "\n".join(pages[:-1]))  # 页脚噪音已剥离
+        self.assertNotIn("AI辅助创作", "\n".join(pages))  # 站点页脚噪音已剥离
 
         print(f"[live] 抓到《{issue.title}》 date={issue.date} 共 {len(pages)} 页")
         print(f"[live] 今天（东八区）是 {today_cst()}")
 
     async def test_rss_parses_many_issues(self) -> None:
-        import logging
         import urllib.request
 
-        logger = logging.getLogger("live-rss")
         req = urllib.request.Request(RSS_URL, headers={"User-Agent": "juya-daily-test"})
         with urllib.request.urlopen(req, timeout=20) as resp:
             raw = resp.read()

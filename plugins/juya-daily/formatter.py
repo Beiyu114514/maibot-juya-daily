@@ -1,11 +1,31 @@
-"""把一期早报渲染成群聊纯文本。"""
+"""把一期早报渲染成群聊纯文本（按单条消息长度自动分页）。
+
+RSS 正文是站点页面转成的纯文本，结构大致是：
+
+    AI 早报 2026-10-19
+    视频版：...
+    概览
+    要闻
+        标题 A ↗ #1
+    技术与洞察
+        标题 B ↗ #2
+    要闻
+        标题 A #1
+        正文……
+    技术与洞察
+        标题 B #2
+        正文……
+
+渲染时要剥掉站点标题、视频版行、概览索引、分组小标题和页脚提示，
+只留「导语（如有）+ 编号条目」。条目按消息长度分页，任何一页都不能超限。
+"""
 
 from __future__ import annotations
 
 import re
 from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:  # 仅类型检查用，运行时不产生依赖
+if TYPE_CHECKING:  # 仅类型检查用，运行时不引入 fetcher 依赖
     from .fetcher import Issue
 
 DEFAULT_FOOTER = (
@@ -13,198 +33,223 @@ DEFAULT_FOOTER = (
     "⚠️ 资讯内容由AI辅助生成，可能存在错误，请以原文为准"
 )
 
-# 条目标题编号出现在行尾：「标题 ↗ #1」（概览）或「标题 #1」（正文）；
-# 只认出现在行尾（后面到行尾没有别的实质内容）的编号，避免误切正文里的 # 字符。
+# 单条消息的长度上限（QQ 群消息偏长也安全；按字符数算，不按字节）
+MESSAGE_CHAR_LIMIT = 1800
+# 多页时每页开头的「（第 x/y 页）」+ 换行占用的预算，装页时先预留，渲染后绝不超限
+PAGE_MARKER_RESERVE = 16
+# 条目被 max_items 截断时的提示；只截条目数量，不截正文
+TRUNCATION_NOTE = "……（仅展示前 {n} 条，完整内容见原文）"
+
+# 条目标题行：以 #N 结尾（概览索引行可能还带 ↗，后面单独过滤）
 _ITEM_HEAD_RE = re.compile(r"(?m)^.{0,120}?#[0-9]{1,3}\s*$")
-# 概览索引行形如「标题 ↗ #1」，也有站点反过来写成「标题 #1 ↗」；
-# 编号会在正文里重复出现，分条/限条数时都应剔除
+# 概览索引行：标题 ↗ #N 或 标题 #N ↗
 _OVERVIEW_LINE_RE = re.compile(
     r"(?m)^.{0,160}?(?:↗[ \t]*#[0-9]{1,3}|#[0-9]{1,3}[ \t]*↗)[ \t]*$"
 )
-
-# 分组小标题（「要闻」「开发生态」…）的识别不靠硬编码名单，靠形态：
-# 行首、短行、前后空行、且紧接着的下一非空行是以「#N」结尾的条目标题行。
-# 站点新增分组照样能剥；正文里恰好单独成行的同名短句（下一行是正文而非编号标题）不会误删。
-_GROUP_TITLE_RE = re.compile(r"(?m)^([^\n#]{1,20})[ \t]*\n\s*\n(?=.{0,120}?#[0-9]{1,3}[ \t]*$)")
-# 收尾的站点页脚（纯操作提示，无资讯内容）
+# 分组小标题：短行 + 空行 + 紧接着以 #N 结尾的条目标题行。
+# 不硬编码「要闻 / 开发生态」等名单，站点改分组名也能剥掉。
+_GROUP_TITLE_RE = re.compile(
+    r"(?m)^([^\n#]{1,20})[ \t]*\n\s*\n(?=.{0,120}?#[0-9]{1,3}[ \t]*$)"
+)
+# 站点页脚提示（从「提示：内容由AI辅助创作」到文末的查看链接）
 _TAIL_NOISE_RE = re.compile(
     r"提示：内容由AI辅助创作.*?查看网页全文(?:\s*·\s*查看 Markdown)?\s*$", re.DOTALL
 )
-# 带「：」引导的视频版行
+# 视频版宣传行
 _VIDEO_LINE_RE = re.compile(r"(?m)^视频版：[^\n]*$")
+# 站点标题行（RSS 正文里会重复出现一次「AI 早报 YYYY-MM-DD」）
+_SITE_TITLE_RE = re.compile(r"(?m)^AI 早报\s*\d{4}-\d{2}-\d{2}\s*$")
+
+# 分组小标题是名词短语；以这些标点结尾或带链接的短行更像正文句子/URL，不能误删
+_SENTENCE_END = tuple("。！？；：，、,.;:!?")
+
+
+def _fill(template: str, **values: str) -> str:
+    """安全替换 {name} 占位符：未知占位符原样保留，缺少的值不炸。"""
+
+    def repl(match: re.Match[str]) -> str:
+        key = match.group(1)
+        if key in values:
+            return str(values[key])
+        return match.group(0)
+
+    return re.sub(r"\{(\w+)\}", repl, template or "")
+
+
+def _looks_like_group_title(name: str) -> bool:
+    """短行是否像分组小标题（而不是恰好短一行的正文/URL）。"""
+    name = name.strip()
+    if not name or "://" in name:
+        return False
+    return not name.endswith(_SENTENCE_END)
+
+
+def _strip_group_titles(text: str) -> str:
+    return _GROUP_TITLE_RE.sub(
+        lambda m: "" if _looks_like_group_title(m.group(1)) else m.group(0), text
+    )
 
 
 def _strip_overview_lines(text: str) -> str:
-    """删掉「标题 ↗ #N」概览索引行（含其后的空行），返回清理后的文本。"""
     return _OVERVIEW_LINE_RE.sub("", text).replace("\n\n\n", "\n\n").strip()
 
 
 def _strip_noise(text: str) -> str:
-    """剥掉推送场景下的纯噪音：概览索引行、收尾页脚、视频版行、分组小标题。"""
-    text = _strip_overview_lines(text)
+    """反复剥噪音，直到概览索引和分组标题都清干净。
+
+    先删概览行再找分组标题会漏掉「概览」和正文里的分组标题（P0-3）；
+    这里交替跑两轮：先 group 再 overview，两轮后分组标题的 lookahead
+    就不会被概览索引行挡住。
+    """
+    text = text or ""
+    for _ in range(2):
+        text = _strip_group_titles(text)
+        text = _strip_overview_lines(text)
+    text = _SITE_TITLE_RE.sub("", text)
     text = _TAIL_NOISE_RE.sub("", text)
     text = _VIDEO_LINE_RE.sub("", text)
-    text = _GROUP_TITLE_RE.sub("", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 
-def split_items(content: str) -> list[str]:
-    """按行尾编号（标题 … #N）把整期内容拆成单条资讯；拆不开就整段返回。"""
-    content = _strip_noise(content or "")
-    heads = [
-        match
-        for match in _ITEM_HEAD_RE.finditer(content)
-        if "↗" not in match.group(0)
-    ]
+def split_issue(content: str | None) -> tuple[str, list[str]]:
+    """把一期正文拆成（导语, 条目列表）。
+
+    导语是第一条编号标题之前的文字；没有编号条目时导语为空、
+    整段正文作为一个条目返回。`max_items` 只该约束条目数量，
+    所以分页前必须先把导语和条目分开（P0-1）。
+    """
+    content = _strip_noise(content)
+    if not content:
+        return "", []
+    heads = [m for m in _ITEM_HEAD_RE.finditer(content) if "↗" not in m.group(0)]
     if len(heads) < 2:
-        return [content] if content else []
-    parts: list[str] = []
+        return "", [content]
+
     intro = content[: heads[0].start()].strip()
-    if intro:
-        parts.append(intro)
-    for idx, head in enumerate(heads):
-        end = heads[idx + 1].start() if idx + 1 < len(heads) else len(content)
-        chunk = _strip_noise(content[head.start() : end])
-        if chunk:
-            parts.append(chunk)
-    return parts
+    items: list[str] = []
+    for index, head in enumerate(heads):
+        end = heads[index + 1].start() if index + 1 < len(heads) else len(content)
+        item = _strip_noise(content[head.start() : end])
+        if item:
+            items.append(item)
+    return intro, items
 
 
-def _fill(template: str, **values: str) -> str:
-    """安全的占位符替换：不认识的 {xxx} 原样保留，不会抛 KeyError。"""
-    text = template or ""
-    for key, value in values.items():
-        text = text.replace("{" + key + "}", value)
-    return text
-
-
-# 单条消息长度上限。QQ 群聊单条消息过长会被平台截断甚至发送失败，
-# 因此按条切页而不是整期一条。
-MESSAGE_CHAR_LIMIT = 1800
+def split_items(content: str | None) -> list[str]:
+    """兼容旧接口：导语（如有）放在第一位，后面是条目。"""
+    intro, items = split_issue(content)
+    return ([intro] if intro else []) + items
 
 
 def _split_long_block(block: str, limit: int) -> list[str]:
-    """把超长文本块按行/硬切分拆成不超过 limit 的若干段。"""
+    """把超长块按行拆成不超过 limit 的段；单行本身超限时硬切。"""
     if len(block) <= limit:
         return [block]
-    segments: list[str] = []
+    pieces: list[str] = []
     current: list[str] = []
-    current_len = 0
+    used = 0
     for line in block.split("\n"):
-        piece_len = len(line) + (1 if current else 0)
-        while len(line) > limit:  # 单行本身就超限（少见），硬切
+        if len(line) > limit:
             if current:
-                segments.append("\n".join(current))
-                current, current_len = [], 0
-            segments.append(line[:limit])
-            line = line[limit:]
-        piece_len = len(line) + (1 if current else 0)
-        if current and current_len + piece_len > limit:
-            segments.append("\n".join(current))
-            current, current_len = [], 0
+                pieces.append("\n".join(current))
+                current, used = [], 0
+            for start in range(0, len(line), limit):
+                pieces.append(line[start : start + limit])
+            continue
+        extra = len(line) + (1 if current else 0)
+        if current and used + extra > limit:
+            pieces.append("\n".join(current))
+            current, used = [], 0
+            extra = len(line)
         current.append(line)
-        current_len += piece_len
+        used += extra
     if current:
-        segments.append("\n".join(current))
-    return segments or [block]
+        pieces.append("\n".join(current))
+    return pieces
+
+
+def _pack_pages(chunks: list[str], limit: int) -> list[list[str]]:
+    """贪心装页：每页的块用空行连接后（含页码行）不超过 limit。"""
+    budget = max(200, limit - PAGE_MARKER_RESERVE)
+    pages: list[list[str]] = []
+    current: list[str] = []
+    used = 0
+    for chunk in chunks:
+        for piece in _split_long_block(chunk, budget):
+            extra = len(piece) + (2 if current else 0)
+            if current and used + extra > budget:
+                pages.append(current)
+                current, used = [], 0
+                extra = len(piece)
+            current.append(piece)
+            used += extra
+    if current:
+        pages.append(current)
+    return pages
 
 
 def paginate_issue(
-    issue: "Issue",
+    issue: Issue,
     max_items: int = 0,
     footer_template: str = DEFAULT_FOOTER,
     stale: bool = False,
     limit: int = MESSAGE_CHAR_LIMIT,
 ) -> list[str]:
-    """渲染整期早报为多条可发送的纯文本消息（分页）。
+    """把一期渲染成若干条消息，每条都不超过 limit 个字符。
 
-    打包策略：尽量按「条」成页（不把一条资讯拦腰截断），
-    单条本身就超限时才按行硬拆；
-    第一条带标题与（必要时）的缓存提示，最后一条带脚注，
-    多页时每页标注「第 x/y 页」。
+    - 导语独立成块，不占 `max_items` 的条数；
+    - 条目数量截断只加提示，正文永不硬截断；
+    - 脚注作为独立块参与分页，全页合计恰好出现一次。
     """
     title = issue.title or f"橘鸦AI早报 {issue.date}".strip()
-    footer = _fill(footer_template or DEFAULT_FOOTER, link=issue.link, date=issue.date, title=title)
-    body = _strip_noise(issue.content or "")
-    items = split_items(body)
+    footer = _fill(
+        footer_template,
+        title=title,
+        link=issue.link or "",
+        date=issue.date or "",
+    )
+
+    intro, items = split_issue(issue.content or "")
+    note = ""
     if max_items and max_items > 0 and len(items) > max_items:
         items = items[:max_items]
-        items.append(f"……（仅展示前 {max_items} 条，完整内容见原文）")
+        note = TRUNCATION_NOTE.format(n=max_items)
 
     header = f"📰 {title}"
     if stale:
         header += f"\n（暂未抓到今天的一期，以下为最近缓存：{issue.date or '日期未知'}）"
+    budget = max(200, limit - PAGE_MARKER_RESERVE)
+    if len(header) > budget - 40:
+        # 超长标题只截标题本身，正文/脚注照常参与分页
+        header = header[: budget - 40].rstrip() + "…"
 
-    # 按条目打包；单条超限的再按行拆
-    chunks: list[str] = []
-    for item in items:
-        if len(item) <= limit:
-            chunks.append(item)
-        else:
-            chunks.extend(_split_long_block(item, limit))
-
-    # 脚注尽量并进最后一个 chunk，装不下就单独成块
+    chunks: list[str] = [header]
+    if intro:
+        chunks.append(intro)
+    chunks.extend(items)
+    if note:
+        chunks.append(note)
     if footer:
-        if chunks:
-            if len(chunks[-1]) + len(footer) + 2 <= limit:
-                chunks[-1] = f"{chunks[-1]}\n\n{footer}"
-            else:
-                chunks.extend(_split_long_block(footer, limit))
-        else:
-            # 正文为空：脚注本身就是全部内容，不要再附加
-            chunks = _split_long_block(footer, limit)
+        chunks.append(footer)
 
-    # 把 chunk 序列打包进「页」，每页不超过 limit
-    pages_body: list[list[str]] = []
-    current: list[str] = []
-    current_len = 0
-    for chunk in chunks:
-        add_len = len(chunk) + (2 if current else 0)
-        if current and current_len + add_len > limit:
-            pages_body.append(current)
-            current, current_len = [], 0
-            add_len = len(chunk)
-        current.append(chunk)
-        current_len += add_len
-    if current:
-        pages_body.append(current)
+    pages = _pack_pages(chunks, limit)
+    if not pages:
+        return []
 
-    pages: list[str] = []
-    total = len(pages_body)
-    for index, blocks in enumerate(pages_body):
-        parts: list[str] = []
+    total = len(pages)
+    rendered: list[str] = []
+    for index, blocks in enumerate(pages):
         if index == 0:
-            parts.append(header)
-        if total > 1:
-            parts.append(f"（第 {index + 1}/{total} 页）")
-        parts.append("\n\n".join(blocks))
-        text = "\n".join(p for p in parts if p)
-        if len(text) > limit:  # 兜底：绝不超限
-            text = text[:limit]
-        pages.append(text)
-    return pages
-
-
-def format_issue(
-    issue: "Issue",
-    max_items: int = 0,
-    footer_template: str = DEFAULT_FOOTER,
-    stale: bool = False,
-) -> str:
-    """渲染一条可直接发送的纯文本消息（不分页，供测试与短内容使用）。"""
-    title = issue.title or f"橘鸦AI早报 {issue.date}".strip()
-    lines = [f"📰 {title}"]
-    if stale:
-        lines.append(f"（暂未抓到今天的一期，以下为最近缓存：{issue.date or '日期未知'}）")
-    body = _strip_noise(issue.content or "")
-    if max_items and max_items > 0:
-        items = split_items(body)
-        if len(items) > max_items:
-            body = "\n\n".join(items[:max_items]) + f"\n\n……（仅展示前 {max_items} 条，完整内容见原文）"
-    if body:
-        lines.append(body)
-    footer = _fill(footer_template or DEFAULT_FOOTER, link=issue.link, date=issue.date, title=title)
-    if footer:
-        lines.append(footer)
-    return "\n\n".join(line for line in lines if line)
+            lines = [blocks[0]]
+            if total > 1:
+                lines.append(f"（第 1/{total} 页）")
+            body = "\n\n".join(blocks[1:])
+            if body:
+                lines.append(body)
+            rendered.append("\n".join(lines))
+        else:
+            rendered.append("\n".join([f"（第 {index + 1}/{total} 页）", "\n\n".join(blocks)]))
+    # 装页时已预留页码预算；这里兜底，任何回归都会在测试里立刻暴露
+    assert all(len(page) <= limit for page in rendered), "分页超过单条上限"
+    return rendered
