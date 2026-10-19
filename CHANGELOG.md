@@ -6,13 +6,13 @@
 
 ### 新增
 
-- **单元测试套件**（`tests/`，83 项，`python3 -m unittest discover -s tests`）：
+- **单元测试套件**（`tests/`，86 项，`python3 -m unittest discover -s tests`）：
   - `test_fetcher`：RSS/Atom 宽容解析、ISO 8601 pubDate、噪音清洗、日期抽取、新旧两种 issue 链接格式
   - `test_formatter`：分条/限条数/分页不超 1800 字、脚注占位符安全替换、概览索引行与站点页脚剥离
   - `test_store`：订阅/退订、推送进度与订阅表分离、v1→v2 迁移、损坏文件备份
-  - `test_plugin`：命令正则不粘连、订阅鉴权、推送成败严格判定（返回 False/抛异常/半程失败都不写进度）、静态群进度、定时编排（今日已推跳过 / 旧一期不推 / 启动补推）、配置热更新重启定时器
+  - `test_plugin`：命令正则不粘连、订阅鉴权、推送成败严格判定（返回 False/抛异常/半程失败都不写进度）、静态群进度、定时编排（今日已推跳过 / 旧一期不推 / 启动补推）、配置热更新重启定时器、SDK 注入契约（`ctx`/`config` 只读、经 `_set_context` / `set_plugin_config` 注入）
   - `test_live_rss`：真实站点集成冒烟（`JUYA_LIVE=1` 开启，默认跳过）
-  - 不依赖真实 MaiBot：缺 `pydantic` / `maibot_sdk` 时自动注入最小桩，CI 装真包
+  - 不依赖真实 MaiBot：缺 `pydantic` / `maibot_sdk` 时自动注入与真实 SDK 可见面对齐的最小桩，CI 装真包（见 `requirements-dev.txt`）
 - **CI 重构**：`.github/workflows/ci.yml` 在 push/PR 跑「真实 SDK + 单元测试」，每晚定时跑一次真实站点冒烟；打包发 Release 改为 `needs: test`，测试不过不发版
 
 ### 修复
@@ -22,6 +22,8 @@
 - **正文清洗残留行首空格**：`\n[ \t]+` 未归一化，分页后出现行首缩进
 - **适配站点链接改版**：详情页从 `/issue-N/` 改为 `/issues/YYYY-MM-DD/`，HTML 兜底的正则已两种都认（RSS 主链路不受影响）
 - **分条前先剥离噪音**：原来只在切片后清理，分组小标题（如「要闻」）会残留在开头
+- **CI 无法启动**：`actions/setup-python` 的 `cache: pip` 让「Setup Python 3.12」这一步直接失败（v0.2.0 首跑实证：test job 从没跑起来、打包被 `needs: test` 跳过、Release 未生成）；已去掉 `cache`，依赖收敛到 `requirements-dev.txt`
+- **测试桩与真实 SDK 脱节**：桩把 `ctx`/`config` 当普通属性、`Command` 不写 `__maibot_component_info__`，本地跑过的代码 CI 里（真实 SDK）行为不同；桩改为对齐真实可见面（只读属性 + `_set_context` / `set_plugin_config` 注入），并加 `SdkContractTest` 锁死该契约
 
 ## [0.1.1] - 2026-10-19
 

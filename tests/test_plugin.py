@@ -71,22 +71,72 @@ def _install_stubs() -> None:
 
             sdk = types.ModuleType("maibot_sdk")
 
-            class Command:
-                def __init__(self, name, pattern=None, **_kwargs):
-                    self.name = name
-                    self.pattern = pattern
+            class _ComponentInfo:
+                """对齐 SDK 的 CommandComponentInfo：只留测试用到的字段。"""
 
-                def __call__(self, func):
-                    func._juya_command = (self.name, self.pattern)
+                def __init__(self, name, description="", command_pattern="", aliases=None, metadata=None):
+                    self.name = name
+                    self.description = description
+                    self.command_pattern = command_pattern
+                    self.aliases = aliases or []
+                    self.metadata = metadata or {}
+
+            def Command(name, description="", pattern="", aliases=None, **metadata):  # noqa: N802
+                def decorator(func):
+                    setattr(
+                        func,
+                        "__maibot_component_info__",
+                        _ComponentInfo(name, description, pattern, aliases, metadata),
+                    )
                     return func
+
+                return decorator
 
             class PluginConfigBase(_BaseModel):
                 pass
 
             class MaiBotPlugin:
+                """对齐真实 SDK 的可见面：ctx/config 是只读属性，靠注入方法赋值。"""
+
+                config_reload_subscriptions = ()
+                config_model = None
+
                 def __init__(self):
-                    self.ctx = None
-                    self.config = None
+                    self._ctx = None
+                    self._plugin_config_data = {}
+                    self._plugin_config_instance = None
+
+                def _set_context(self, ctx):
+                    self._ctx = ctx
+
+                def set_plugin_config(self, config):
+                    self._plugin_config_data = dict(config or {})
+                    config_class = type(self).get_config_model()
+                    self._plugin_config_instance = (
+                        config_class(**self._plugin_config_data) if config_class else None
+                    )
+
+                @classmethod
+                def get_config_model(cls):
+                    return cls.config_model
+
+                @classmethod
+                def has_config_model(cls):
+                    return cls.get_config_model() is not None
+
+                @property
+                def ctx(self):
+                    if self._ctx is None:
+                        raise RuntimeError("插件上下文尚未初始化")
+                    return self._ctx
+
+                @property
+                def config(self):
+                    if not type(self).has_config_model():
+                        raise RuntimeError("当前插件未声明 config_model")
+                    if self._plugin_config_instance is None:
+                        raise RuntimeError("当前插件配置尚未完成注入")
+                    return self._plugin_config_instance
 
             sdk.Command = Command
             sdk.PluginConfigBase = PluginConfigBase
@@ -169,11 +219,35 @@ class FakeCtx:
         self.logger = LOGGER
 
 
+def dump_config(config) -> dict:
+    """把配置实例转成嵌套 dict（真 pydantic 与桩都要能转）。"""
+    if hasattr(config, "model_dump"):
+        return config.model_dump()
+    dumped: dict = {}
+    for key, value in vars(config).items():
+        if hasattr(value, "model_dump"):
+            dumped[key] = value.model_dump()
+        else:
+            dumped[key] = value
+    return dumped
+
+
+def wire(plugin, ctx, config) -> None:
+    """按 SDK 的注入接口装配 ctx 与 config（兼容真实 SDK 与桩）。"""
+    if hasattr(plugin, "_set_context"):
+        plugin._set_context(ctx)
+    else:  #  pragma: no cover - 桩之外的异常布局
+        plugin.ctx = ctx
+    if hasattr(plugin, "set_plugin_config"):
+        plugin.set_plugin_config(dump_config(config))
+    else:  # pragma: no cover
+        plugin.config = config
+
+
 def build_plugin(tmp: str, send=None, chat=None, **config_fields) -> JuyaDailyPlugin:
     """绕过 on_load 直接装配，避免测试里起真实定时器和网络请求。"""
     plugin = create_plugin()
-    plugin.ctx = FakeCtx(tmp, send=send, chat=chat)
-    plugin.config = JuyaDailyConfig(**config_fields)
+    wire(plugin, FakeCtx(tmp, send=send, chat=chat), JuyaDailyConfig(**config_fields))
     plugin._tasks = set()
     plugin._static_stream_ids = {}
     plugin._store = Store(os.path.join(tmp, "state.json"))
@@ -239,11 +313,15 @@ class CommandRoutingTest(unittest.TestCase):
         self.plugin = build_plugin(tempfile.mkdtemp())
 
     def _commands(self) -> dict:
+        """收集所有 @Command 声明的命令 -> 正则（真实 SDK 与桩用同一属性名）。"""
         found = {}
         for name in dir(JuyaDailyPlugin):
             attr = getattr(JuyaDailyPlugin, name)
-            if callable(attr) and hasattr(attr, "_juya_command"):
-                found[attr._juya_command[0]] = attr._juya_command[1]
+            if not callable(attr):
+                continue
+            info = getattr(attr, "__maibot_component_info__", None)
+            if info is not None:
+                found[info.name] = info.command_pattern
         return found
 
     def test_all_commands_registered(self) -> None:
@@ -264,11 +342,41 @@ class CommandRoutingTest(unittest.TestCase):
 
     def test_handler_returns_triple(self) -> None:
         async def scenario() -> None:
+            today = plugin_module.today_cst()
+
+            async def fake_fetch(force=False):
+                return make_issue(today)
+
+            self.plugin._fetcher.fetch_latest = fake_fetch  # type: ignore[assignment]
             result = await self.plugin.cmd_daily(stream_id="s1")
             self.assertEqual(len(result), 3)
             self.assertIsInstance(result[0], bool)
+            self.assertTrue(result[0])
 
         asyncio.run(scenario())
+
+
+class SdkContractTest(unittest.TestCase):
+    """锁定 SDK 注入契约：真实 SDK 与桩都必须经注入方法赋值，不能直接属性赋值。"""
+
+    def test_ctx_and_config_are_read_only(self) -> None:
+        plugin = create_plugin()
+        with self.assertRaises(AttributeError):
+            plugin.ctx = FakeCtx(tempfile.mkdtemp())
+        with self.assertRaises(AttributeError):
+            plugin.config = JuyaDailyConfig()
+
+    def test_wire_injects_ctx_and_config(self) -> None:
+        tmp = tempfile.mkdtemp()
+        plugin = create_plugin()
+        wire(plugin, FakeCtx(tmp), JuyaDailyConfig(schedule={"push_time": "06:00"}))
+        self.assertEqual(plugin.config.schedule.push_time, "06:00")
+        self.assertIs(plugin.ctx.paths.data_dir, tmp)
+
+    def test_config_readable_before_injection_raises(self) -> None:
+        plugin = create_plugin()
+        with self.assertRaises(RuntimeError):
+            _ = plugin.config
 
 
 class SubscribeCommandTest(unittest.TestCase):
@@ -538,8 +646,7 @@ class LifecycleTest(unittest.TestCase):
 
         async def scenario() -> None:
             plugin = create_plugin()
-            plugin.ctx = FakeCtx(tmp)
-            plugin.config = JuyaDailyConfig(schedule={"catch_up_on_start": False})
+            wire(plugin, FakeCtx(tmp), JuyaDailyConfig(schedule={"catch_up_on_start": False}))
             await plugin.on_load()
             self.assertIsNotNone(plugin._scheduler.next_run())
             self.assertTrue(os.path.isdir(tmp))
@@ -554,8 +661,11 @@ class LifecycleTest(unittest.TestCase):
 
         async def scenario() -> None:
             plugin = create_plugin()
-            plugin.ctx = FakeCtx(tmp)
-            plugin.config = JuyaDailyConfig(schedule={"catch_up_on_start": False, "push_time": "08:30"})
+            wire(
+                plugin,
+                FakeCtx(tmp),
+                JuyaDailyConfig(schedule={"catch_up_on_start": False, "push_time": "08:30"}),
+            )
             await plugin.on_load()
             old = plugin._scheduler
             plugin.config.schedule.push_time = "07:15"
@@ -572,8 +682,7 @@ class LifecycleTest(unittest.TestCase):
 
         async def scenario() -> None:
             plugin = create_plugin()
-            plugin.ctx = FakeCtx(tmp)
-            plugin.config = JuyaDailyConfig(schedule={"catch_up_on_start": False})
+            wire(plugin, FakeCtx(tmp), JuyaDailyConfig(schedule={"catch_up_on_start": False}))
             await plugin.on_load()
             old = plugin._scheduler
             await plugin.on_config_update("bot", {}, 1)

@@ -25,12 +25,15 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
+          # 不开 cache: pip —— 缓存解析失败会让本步直接红（v0.2.0 首跑即此因）。
+          # 现在 requirements-dev.txt 已在仓库里，若要加速可改成：
+          #   cache: pip
+          #   cache-dependency-path: requirements-dev.txt
 
       - name: Install SDK（CI 里用真包，本地无 pip 时测试自带桩）
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pydantic maibot-plugin-sdk
+          python -m pip install -r requirements-dev.txt
 
       - name: Syntax check
         run: python -m py_compile plugins/juya-daily/*.py

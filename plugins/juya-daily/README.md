@@ -75,11 +75,11 @@ stale_deadline = "12:00"   # 当天一期超过这个时间还没发布就放弃
 ```bash
 # 在 MaiBot 仓库的 plugins/ 目录下（或任意位置）跑：
 python3 -m py_compile plugins/juya-daily/*.py          # 语法检查
-python3 -m unittest discover -s tests -v               # 单元测试（83 项）
+python3 -m unittest discover -s tests -v               # 单元测试（86 项）
 JUYA_LIVE=1 python3 -m unittest tests.test_live_rss -v # 真实站点冒烟（默认跳过）
 ```
 
-测试不依赖真实 MaiBot：缺 `pydantic` / `maibot_sdk` 时自动注入最小桩，CI 里装真包。
+测试不依赖真实 MaiBot：缺 `pydantic` / `maibot_sdk` 时自动注入最小桩（与真实 SDK 可见面对齐），CI 里装真包；要装真包见仓库根目录 `requirements-dev.txt`。
 
 ## 注意
 

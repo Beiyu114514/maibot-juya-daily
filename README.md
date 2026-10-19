@@ -86,7 +86,7 @@ stale_deadline = "12:00"   # 当天一期超过这个时间还没发布就放弃
 # 语法检查
 python3 -m py_compile plugins/juya-daily/*.py
 
-# 单元测试（83 项：RSS 解析 / 排版分页 / 状态落盘 / 定时器 / 推送成败判定）
+# 单元测试（86 项：RSS 解析 / 排版分页 / 状态落盘 / 定时器 / 推送成败判定 / SDK 注入契约）
 python3 -m unittest discover -s tests -v
 
 # 真实站点集成测试（会请求 daily.juya.uk，默认跳过）
@@ -96,7 +96,7 @@ JUYA_LIVE=1 python3 -m unittest tests.test_live_rss -v
 git tag v0.2.0 && git push origin v0.2.0
 ```
 
-测试不需要真实 MaiBot 环境：缺 `pydantic` / `maibot_sdk` 时会自动注入最小桩（CI 里装真包，走真实实现）。
+测试不需要真实 MaiBot 环境：缺 `pydantic` / `maibot_sdk` 时会自动注入最小桩（CI 里装真包，走真实实现）。桩按真实 SDK 可见面对齐（`ctx`/`config` 只读、经 `_set_context` / `set_plugin_config` 注入、`Command` 写 `__maibot_component_info__`），本地与 CI 覆盖同一代码路径；要装真包：`pip install -r requirements-dev.txt`。
 夜间定时任务（`.github/workflows/ci.yml`）会跑一次 `JUYA_LIVE=1`，站点改版能最早发现。
 
 项目结构：
