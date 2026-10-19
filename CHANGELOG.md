@@ -2,6 +2,19 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.1] - 2026-10-19
+
+### 修复
+
+- **Release 安装包多套一层目录，WebUI「从 ZIP 安装插件」被拒**：0.3.0 用 `zip -r juya-daily-0.3.0.zip plugins/juya-daily` 打成 `plugins/juya-daily/…`，而宿主只认「ZIP 根目录或唯一一层插件目录」里的 `_manifest.json`，于是报「ZIP 根目录或唯一一层插件目录中必须包含 _manifest.json」。现在固定打成 `juya-daily/…`，解压即得插件目录内容
+
+### 工程化
+
+- 新增 `scripts/package_plugin.py`：纯标准库打包 + 按 MaiBot 规则校验（唯一一层插件目录、`_manifest.json`/`plugin.py` 位置、100 MB / 解压 300 MB / 10000 文件上限、拒绝 `../`、符号链接、加密条目、`.git`/`__MACOSX`），固定时间戳保证同内容 sha256 一致；本地与 CI 共用同一套规则
+- CI 打包步骤改用该脚本并在发布前复核结构，旧的双层包会被直接拦下
+- 新增 `tests/test_packaging.py`（20 项）：钉住包布局、确定性与各类拒绝路径；测试总数 145 → 165
+- `USER_AGENT` 的兜底版本收敛为 `_FALLBACK_VERSION`，不再散落魔法字符串
+
 ## [0.3.0] - 2026-10-19
 
 ### 新增

@@ -48,12 +48,16 @@ jobs:
         run: python -m py_compile plugins/juya-daily/*.py
 
       - name: Lint（只查未定义名/语法类硬错误）
-        run: ruff check plugins/juya-daily tests --select E9,F63,F7,F82
+        run: ruff check plugins/juya-daily tests scripts --select E9,F63,F7,F82
 
       - name: Unit tests + coverage
         run: |
           coverage run -m unittest discover -s tests -v
           coverage report --fail-under=80
+
+      # 单独跑一遍，失败信息比 coverage 汇总更直观（tests 里也已包含）
+      - name: 校验安装包结构（MaiBot ZIP 规则）
+        run: python -m unittest tests.test_packaging -v
 
       - name: Live RSS smoke（仅定时触发，避免 PR 受站点波动影响）
         id: live
@@ -106,13 +110,17 @@ jobs:
           python-version: "3.12"
       - run: python -m py_compile plugins/juya-daily/*.py
 
-      - name: Zip plugin
+      # 必须打成「ZIP 内唯一一层 juya-daily/」，不能是 plugins/juya-daily/：
+      # MaiBot WebUI 的 ZIP 安装只认根目录或唯一一层插件目录里的 _manifest.json，
+      # v0.3.0 的包多套了 plugins/ 一层，导入时报「根目录或唯一一层插件目录中必须
+      # 包含 _manifest.json」。结构校验写在脚本里，本地与 CI 共用同一套规则。
+      - name: Build plugin ZIP（唯一一层 juya-daily/）
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          zip -r "juya-daily-${VERSION}.zip" plugins/juya-daily \
-            -x "*__pycache__*" "*.pyc"
-          echo "ZIP_NAME=juya-daily-${VERSION}.zip" >> "$GITHUB_ENV"
-          sha256sum "juya-daily-${VERSION}.zip" > "juya-daily-${VERSION}.zip.sha256"
+          NAME="$(python scripts/package_plugin.py --out-dir . --print-name)"
+          echo "ZIP_NAME=${NAME}" >> "$GITHUB_ENV"
+          python scripts/package_plugin.py --verify "${NAME}"   # 复核结构，防止回归
+          test -f "${NAME}.sha256"
+          ls -l "${NAME}" "${NAME}.sha256"
 
       - name: Upload artifact（手动触发 / 非 tag 构建可在此下载）
         uses: actions/upload-artifact@v4

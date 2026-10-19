@@ -25,13 +25,17 @@ SITE_URL = "https://daily.juya.uk/"
 CST = timezone(timedelta(hours=8))
 
 
+# manifest 读不到时的兜底版本号，发版时与 _manifest.json 一起改
+_FALLBACK_VERSION = "0.3.1"
+
+
 def _plugin_version() -> str:
     """从同目录 _manifest.json 读版本，避免 User-Agent 长年停在 0.1。"""
     try:
         with open(Path(__file__).with_name("_manifest.json"), encoding="utf-8") as fh:
-            return str(json.load(fh).get("version") or "0.3.0")
+            return str(json.load(fh).get("version") or _FALLBACK_VERSION)
     except (OSError, ValueError, TypeError):
-        return "0.3.0"
+        return _FALLBACK_VERSION
 
 
 USER_AGENT = f"MaiBot-juya-daily-plugin/{_plugin_version()} (+https://daily.juya.uk/)"

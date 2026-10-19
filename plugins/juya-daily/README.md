@@ -12,7 +12,9 @@ MaiBot 插件：订阅 [橘鸦AI早报](https://daily.juya.uk/)，每天定时�
    pip install maibot-plugin-sdk
    ```
 
-2. 把 `juya-daily/` 整个目录放到 MaiBot 的 `plugins/` 下：
+2. 放插件目录，二选一：
+   - **WebUI 导入**：下载 Release 里的 `juya-daily-x.y.z.zip`，在「插件扩展 → 更多操作 → 从 ZIP 安装插件」上传。包内只有一层 `juya-daily/`，不要再套 `plugins/`（多一层会被拒：「ZIP 根目录或唯一一层插件目录中必须包含 _manifest.json」）。
+   - **手动拷贝**：把 `juya-daily/` 整个目录放到 MaiBot 的 `plugins/` 下：
 
    ```text
    plugins/
@@ -26,7 +28,7 @@ MaiBot 插件：订阅 [橘鸦AI早报](https://daily.juya.uk/)，每天定时�
        └── config.toml   # 首次启动自动生成，也可手动放置
    ```
 
-3. 重启 Runner。首次加载会自动生成配置并注册 WebUI 表单。
+3. 重启 Runner（手动安装）或在「管理插件」里启用。首次加载会自动生成配置并注册 WebUI 表单。
 
 ## 使用
 

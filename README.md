@@ -23,7 +23,32 @@ MaiBot 插件：订阅 [橘鸦AI早报](https://daily.juya.uk/)，每天定时�
 
 ## 📦 安装
 
-从 [Release](https://github.com/Beiyu114514/maibot-juya-daily/releases/latest) 下载 `juya-daily-x.y.z.zip`（或克隆本仓库），把 `juya-daily/` 整个目录放到 MaiBot 的 `plugins/` 下：
+### 方式一：WebUI 上传 ZIP（推荐）
+
+从 [Release](https://github.com/Beiyu114514/maibot-juya-daily/releases/latest) 下载 `juya-daily-x.y.z.zip`，在 MaiBot WebUI 打开「插件扩展 → 更多操作 → 从 ZIP 安装插件」上传即可。
+
+安装包固定为「ZIP 内唯一一层 `juya-daily/`」：
+
+```text
+juya-daily-x.y.z.zip
+└── juya-daily/
+    ├── _manifest.json
+    ├── plugin.py
+    ├── fetcher.py
+    ├── formatter.py
+    ├── scheduler.py
+    ├── store.py
+    ├── config.example.toml
+    └── README.md
+```
+
+安装后文件监听器会发现新插件，并按 `config_model` 生成 `plugins/juya-daily/config.toml`；`enabled` 默认是 `false`，到「管理插件」手动打开开关即可，正常不需要重启 MaiBot。同 ID 插件已装过时，先卸载再装。
+
+> ⚠️ **包结构别多套一层**：`_manifest.json` 和 `plugin.py` 必须位于 ZIP 根目录或唯一一层插件目录里。打成 `plugins/juya-daily/…` 会被宿主拒绝，提示「ZIP 根目录或唯一一层插件目录中必须包含 _manifest.json」。**v0.3.0 的 Release 包就是这种坏结构，请改用 v0.3.1 及以上**；自己打包请用 `python3 scripts/package_plugin.py`（会按同样规则校验）。
+
+### 方式二：手动放目录
+
+克隆本仓库，把 `plugins/juya-daily/` 整个目录拷到 MaiBot 的 `plugins/` 下：
 
 ```text
 MaiBot/
@@ -90,14 +115,17 @@ stale_deadline = "12:00"   # 当天一期超过这个时间还没发布就放弃
 # 语法检查
 python3 -m py_compile plugins/juya-daily/*.py
 
-# 单元测试（145 项：RSS 解析 / 排版分页 / 状态落盘与迁移 / 定时器 / 推送成败与断点续传 / 并发去重 / SDK 注入契约 / 配置模型可实例化）
+# 单元测试（165 项：RSS 解析 / 排版分页 / 状态落盘与迁移 / 定时器 / 推送成败与断点续传 / 并发去重 / SDK 注入契约 / 配置模型可实例化 / 安装包结构）
 python3 -m unittest discover -s tests -v
 
 # 真实站点集成测试（会请求 daily.juya.uk，默认跳过）
 JUYA_LIVE=1 python3 -m unittest tests.test_live_rss -v
 
-# 打包（或直接推 v* tag，Actions 自动跑测试、打包并发布 Release）
-git tag v0.3.0 && git push origin v0.3.0
+# 打包（产出 dist/juya-daily-x.y.z.zip + .sha256，并校验是否符合 MaiBot 的 ZIP 安装规则）
+python3 scripts/package_plugin.py
+
+# 发版：manifest 版本必须与 tag 一致，推 v* tag 后 Actions 自动测试、打包并发布 Release
+git tag v0.3.1 && git push origin v0.3.1
 ```
 
 测试不需要真实 MaiBot 环境：缺 `pydantic` / `maibot_sdk` 时会自动注入最小桩（CI 里装真包，走真实实现）。桩按真实 SDK 可见面对齐（`ctx`/`config` 只读、经 `_set_context` / `set_plugin_config` 注入、`Command` 写 `__maibot_component_info__`），本地与 CI 覆盖同一代码路径；要装真包：`pip install -r requirements-dev.txt`。
@@ -107,7 +135,8 @@ git tag v0.3.0 && git push origin v0.3.0
 
 ```text
 .github/workflows/ci.yml      # CI：单元测试（+ 夜间真实站点冒烟）+ 打包 zip + 发布 Release
-tests/                        # unittest：test_fetcher / test_formatter / test_store / test_scheduler / test_plugin / test_live_rss + fuzz
+scripts/package_plugin.py     # 按 MaiBot 规则打包/校验安装包（唯一一层 juya-daily/）
+tests/                        # unittest：test_fetcher / test_formatter / test_store / test_scheduler / test_plugin / test_packaging / test_live_rss + fuzz
 plugins/juya-daily/
 ├── plugin.py      # 入口：命令、生命周期、推送编排
 ├── fetcher.py     # RSS 抓取解析（HTML 兜底、重试、当日缓存）
