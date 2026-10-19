@@ -1,0 +1,56 @@
+name: Package juya-daily
+
+on:
+  push:
+    tags:
+      - "v*"            # 推送 v0.1.0 这类 tag 时打包并发布 Release
+  workflow_dispatch:     # 也允许在 Actions 页面手动触发
+
+permissions:
+  contents: write        # 创建 Release 需要写权限
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify plugin files
+        run: |
+          test -f plugins/juya-daily/plugin.py
+          test -f plugins/juya-daily/_manifest.json
+          echo "--- manifest ---"
+          cat plugins/juya-daily/_manifest.json
+
+      - name: Syntax check (py3.12, 同 MaiBot 要求)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m py_compile plugins/juya-daily/*.py
+
+      - name: Zip plugin
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          zip -r "juya-daily-${VERSION}.zip" plugins/juya-daily \
+            -x "*__pycache__*" "*.pyc"
+          echo "ZIP_NAME=juya-daily-${VERSION}.zip" >> "$GITHUB_ENV"
+          sha256sum "juya-daily-${VERSION}.zip" > "juya-daily-${VERSION}.zip.sha256"
+
+      - name: Upload artifact（手动触发 / 非 tag 构建可在此下载）
+        uses: actions/upload-artifact@v4
+        with:
+          name: juya-daily
+          path: |
+            juya-daily-*.zip
+            juya-daily-*.zip.sha256
+          if-no-files-found: error
+
+      - name: Create Release & attach zip
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            juya-daily-*.zip
+            juya-daily-*.zip.sha256
+          generate_release_notes: true
