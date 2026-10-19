@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "com.juya.daily",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "name": "橘鸦AI早报",
   "description": "订阅 https://daily.juya.uk/ 每日 AI 资讯早报：群内自助订阅，每天定时推送（纯文本 / QQ Markdown / 长图），支持 /早报 即取即看与失败重试。",
   "author": {

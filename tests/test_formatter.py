@@ -424,11 +424,30 @@ class ImageHtmlTest(unittest.TestCase):
         self.assertIn('class="item-body"', html)
         self.assertIn("来源：橘鸦AI早报", html)
         self.assertIn("width:760px", html)
+        self.assertIn("font-size:18px", html)  # 正文默认字号
         # 不引用外部资源，浏览器无需联网
         self.assertNotIn("<script", html)
         self.assertNotIn("http://", html)
         self.assertNotIn("<link", html)
         self.assertNotIn("<img", html)
+
+    def test_render_issue_html_scales_all_font_sizes(self) -> None:
+        """自定义字号要按版式比例同步缩放标题/正文/脚注，而不是只改正文。"""
+        html = render_issue_html(make_issue(), font_size=30)
+        self.assertIn("font-size:30px", html)  # 正文
+        self.assertIn("h1{font-size:58px", html)  # 30 * 29/15
+        self.assertIn(".item-title{font-size:37px", html)  # 30 * 18.5/15
+        self.assertIn(
+            "border-top:1px dashed #dfe5f0;font-size:25px", html
+        )  # 30 * 12.5/15
+
+    def test_render_issue_html_clamps_font_size(self) -> None:
+        low = render_issue_html(make_issue(), font_size=4)
+        self.assertIn(".item-body{font-size:12px", low)
+        high = render_issue_html(make_issue(), font_size=999)
+        self.assertIn(".item-body{font-size:40px", high)
+        fallback = render_issue_html(make_issue(), font_size="bad")  # type: ignore[arg-type]
+        self.assertIn(".item-body{font-size:18px", fallback)
 
     def test_render_issue_html_escapes_markup(self) -> None:
         issue = make_issue("<script>alert(1)</script> & 标题 #1\n正文 <b>加粗</b>")

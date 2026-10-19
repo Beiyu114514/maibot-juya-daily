@@ -24,6 +24,10 @@ try:  # 以包形式加载（plugins.juya_daily.plugin）
     from .fetcher import Issue, JuyaFetcher, now_cst, today_cst
     from .formatter import (
         DEFAULT_FOOTER,
+        IMAGE_CARD_WIDTH,
+        IMAGE_FONT_SIZE,
+        IMAGE_FONT_SIZE_MAX,
+        IMAGE_FONT_SIZE_MIN,
         markdown_to_plain,
         paginate_issue,
         paginate_issue_markdown,
@@ -41,6 +45,10 @@ except ImportError:  # 以目录形式直接加载时的兜底
     from fetcher import Issue, JuyaFetcher, now_cst, today_cst
     from formatter import (
         DEFAULT_FOOTER,
+        IMAGE_CARD_WIDTH,
+        IMAGE_FONT_SIZE,
+        IMAGE_FONT_SIZE_MAX,
+        IMAGE_FONT_SIZE_MIN,
         markdown_to_plain,
         paginate_issue,
         paginate_issue_markdown,
@@ -131,11 +139,21 @@ class PushSection(PluginConfigBase):
         json_schema_extra={"label": "消息格式"},
     )
     image_width: int = Field(
-        760,
+        IMAGE_CARD_WIDTH,
         ge=480,
         le=1200,
         description="长图渲染宽度（CSS 像素），QQ 手机端建议 720–800",
         json_schema_extra={"label": "长图宽度（px）"},
+    )
+    image_font_size: int = Field(
+        IMAGE_FONT_SIZE,
+        ge=IMAGE_FONT_SIZE_MIN,
+        le=IMAGE_FONT_SIZE_MAX,
+        description=(
+            "长图正文字号（CSS 像素），标题/脚注按版式比例缩放；"
+            "手机端会把长图等比缩小，觉得字小就调大（建议 22–30）"
+        ),
+        json_schema_extra={"label": "长图字号（px）"},
     )
     image_scale: float = Field(
         2.0,
@@ -605,7 +623,10 @@ class JuyaDailyPlugin(MaiBotPlugin):
             result = await self.ctx.render.html2png(
                 html_text,
                 selector="body",
-                viewport={"width": int(self.config.push.image_width or 760), "height": 800},
+                viewport={
+                    "width": int(self.config.push.image_width or IMAGE_CARD_WIDTH),
+                    "height": 800,
+                },
                 device_scale_factor=float(self.config.push.image_scale or 2.0),
                 full_page=True,
                 render_timeout_ms=int(self.config.push.image_timeout_ms or 30000),
@@ -627,7 +648,10 @@ class JuyaDailyPlugin(MaiBotPlugin):
         max_height = int(self.config.push.image_max_height or 0)
         if max_height and height > max_height:
             self.ctx.logger.error(
-                "长图高度 %d 超过上限 %d，回退纯文本", height, max_height
+                "长图高度 %d 超过上限 %d，回退纯文本（可调大 image_max_height "
+                "或调小 image_font_size / image_width）",
+                height,
+                max_height,
             )
             return ""
         self.ctx.logger.info(
@@ -663,21 +687,24 @@ class JuyaDailyPlugin(MaiBotPlugin):
             stale=stale,
         )
 
+    def _render_image_html(self, issue: Issue, stale: bool = False) -> str:
+        """按当前配置把一期渲染成长图 HTML，保证命令与定时推送两条路径一致。"""
+        return render_issue_html(
+            issue,
+            max_items=int(self.config.push.max_items or 0),
+            footer_template=self.config.push.footer or DEFAULT_FOOTER,
+            stale=stale,
+            width=int(self.config.push.image_width or IMAGE_CARD_WIDTH),
+            font_size=int(self.config.push.image_font_size or IMAGE_FONT_SIZE),
+        )
+
     async def _send_image_issue(self, issue: Issue, stream_id: str, stale: bool = False) -> bool:
         """渲染整期长图并发送；渲染或发送失败时整期回退纯文本。
 
         供 ``/早报`` 手动命令使用，不写推送进度；定时推送与补推走
         :meth:`_push_image_issue`，回退文本时会逐页续传。
         """
-        max_items = int(self.config.push.max_items or 0)
-        footer_template = self.config.push.footer or DEFAULT_FOOTER
-        html_text = render_issue_html(
-            issue,
-            max_items=max_items,
-            footer_template=footer_template,
-            stale=stale,
-            width=int(self.config.push.image_width or 760),
-        )
+        html_text = self._render_image_html(issue, stale=stale)
         image_base64 = await self._render_html_png(html_text)
         if image_base64 and await self._send_image(image_base64, stream_id):
             return True
@@ -754,13 +781,7 @@ class JuyaDailyPlugin(MaiBotPlugin):
                 len(pages),
             )
             return await self._push_pages(stream_id, issue, pages, "text", start=start)
-        html_text = render_issue_html(
-            issue,
-            max_items=int(self.config.push.max_items or 0),
-            footer_template=self.config.push.footer or DEFAULT_FOOTER,
-            stale=False,
-            width=int(self.config.push.image_width or 760),
-        )
+        html_text = self._render_image_html(issue)
         image_base64 = await self._render_html_png(html_text)
         if image_base64 and await self._send_image(image_base64, stream_id):
             self._store.set_push_progress(stream_id, issue.date, page=1, done=True)

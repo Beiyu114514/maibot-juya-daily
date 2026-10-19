@@ -74,7 +74,7 @@ MaiBot/
 | `/早报退订` | 取消订阅（当前会话） |
 | `/早报状态` | 查看订阅状态、推送时间与最近一期 |
 
-推送内容为日期标题 + 编号条目 + 脚注（含原文链接与「AI 辅助生成，可能存在错误」提示）。默认纯文本；把 `[push] message_format` 设为 `"markdown"` 后使用 QQ Markdown（标题、加粗、可点击原文链接），需要 [WhiteCloudOL/qq-official-adapter](https://github.com/WhiteCloudOL/qq-official-adapter) 等支持 `qq_markdown` 结构化消息的适配器，发送失败会自动回退纯文本。设为 `"image"` 则整期渲染成一张竖版长图（走宿主 `render.html2png` + `send.image`），QQ 官方机器人与本地客户端路线都能显示，渲染/发送失败同样回退纯文本。
+推送内容为日期标题 + 编号条目 + 脚注（含原文链接与「AI 辅助生成，可能存在错误」提示）。默认纯文本；把 `[push] message_format` 设为 `"markdown"` 后使用 QQ Markdown（标题、加粗、可点击原文链接），需要 [WhiteCloudOL/qq-official-adapter](https://github.com/WhiteCloudOL/qq-official-adapter) 等支持 `qq_markdown` 结构化消息的适配器，发送失败会自动回退纯文本。设为 `"image"` 则整期渲染成一张竖版长图（走宿主 `render.html2png` + `send.image`），QQ 官方机器人与本地客户端路线都能显示，渲染/发送失败同样回退纯文本；手机端字小可用 `image_font_size` 调大正文字号（默认 18，推荐 22–30）。
 
 ## ⚙️ 配置
 
@@ -91,8 +91,9 @@ admin_only = false         # 仅管理员可订阅/退订
 [push]
 message_format = "text"    # text=纯文本；markdown=QQ Markdown；image=长图
 image_width = 760          # 长图宽度（CSS 像素）
+image_font_size = 18       # 长图正文字号（px，12–40；手机端字小可调到 22–30）
 image_scale = 2.0          # 长图清晰度（设备像素比）
-image_max_height = 16000   # 长图像素高度上限，超过回退纯文本
+image_max_height = 16000   # 长图像素高度上限（设备像素），超过回退纯文本
 image_timeout_ms = 30000   # 长图渲染超时（毫秒）
 max_items = 0              # 每期最多推几条，0 = 全部
 footer = "…"               # 脚注模板，支持 {link} {date} {title}
@@ -113,7 +114,7 @@ stale_deadline = "12:00"   # 当天一期超过这个时间还没发布就放弃
 - **无 SDK 定时组件**，插件用 asyncio 后台任务自建每日定时器；热重载（新建 Runner 进程）时任务随插件卸载而取消，状态由落盘保证。
 - **容错**：RSS/Atom 宽容解析 + HTML 兜底；推送失败按 `retry_minutes × retry_times` 重试；当天早报未发布时每 30 分钟重查，到 `stale_deadline` 放弃。
 - **风控友好**：启动补推与多群推送并发发起，各目标随机错峰 30–120 秒（`stagger_min_seconds` / `stagger_max_seconds`）。
-- **分页与格式**：纯文本单条 ≤1800 字，Markdown 单条 ≤3800 字（适配器硬上限 4000），二者都自动分页并带页码；长图模式整期一张，超过 `image_max_height` 或渲染失败时回退纯文本，回退后按页记录进度、重试只补剩余页。
+- **分页与格式**：纯文本单条 ≤1800 字，Markdown 单条 ≤3800 字（适配器硬上限 4000），二者都自动分页并带页码；长图模式整期一张，可用 `image_font_size`（默认 18，范围 12–40）放大手机端字号，超过 `image_max_height` 或渲染失败时回退纯文本（字号调大后长图更高，可同步上调该上限），回退后按页记录进度、重试只补剩余页。
 
 ## 🏗️ 开发
 
@@ -121,7 +122,7 @@ stale_deadline = "12:00"   # 当天一期超过这个时间还没发布就放弃
 # 语法检查
 python3 -m py_compile plugins/juya-daily/*.py
 
-# 单元测试（187 项：RSS 解析 / 排版分页 / Markdown 渲染与回退 / 长图 HTML 与回退 / 状态落盘与迁移 / 定时器 / 推送成败与断点续传 / 并发去重 / SDK 注入契约 / 配置模型可实例化 / 安装包结构）
+# 单元测试（191 项：RSS 解析 / 排版分页 / Markdown 渲染与回退 / 长图 HTML 与字号与回退 / 状态落盘与迁移 / 定时器 / 推送成败与断点续传 / 并发去重 / SDK 注入契约 / 配置模型可实例化 / 安装包结构）
 python3 -m unittest discover -s tests -v
 
 # 真实站点集成测试（会请求 daily.juya.uk，默认跳过）
@@ -131,7 +132,7 @@ JUYA_LIVE=1 python3 -m unittest tests.test_live_rss -v
 python3 scripts/package_plugin.py
 
 # 发版：manifest 版本必须与 tag 一致，推 v* tag 后 Actions 自动测试、打包并发布 Release
-git tag v0.5.0 && git push origin v0.5.0
+git tag v0.6.0 && git push origin v0.6.0
 ```
 
 测试不需要真实 MaiBot 环境：缺 `pydantic` / `maibot_sdk` 时会自动注入最小桩（CI 里装真包，走真实实现）。桩按真实 SDK 可见面对齐（`ctx`/`config` 只读、经 `_set_context` / `set_plugin_config` 注入、`Command` 写 `__maibot_component_info__`），本地与 CI 覆盖同一代码路径；要装真包：`pip install -r requirements-dev.txt`。

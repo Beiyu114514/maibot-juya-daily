@@ -517,6 +517,7 @@ class ConfigModelTest(unittest.TestCase):
         self.assertEqual(cfg.push.max_items, 0)
         self.assertEqual(cfg.push.message_format, "text")
         self.assertEqual(cfg.push.image_width, 760)
+        self.assertEqual(cfg.push.image_font_size, 18)
         self.assertEqual(cfg.push.image_scale, 2.0)
         self.assertEqual(cfg.push.image_max_height, 16000)
         self.assertEqual(cfg.push.image_timeout_ms, 30000)
@@ -835,6 +836,49 @@ class ImagePushTest(unittest.TestCase):
             self.assertEqual(image_data, "aW1n")
             self.assertTrue(plugin._store.push_state("s1")["done"])
             self.assertEqual(plugin._store.last_pushed_date("s1"), "2026-10-19")
+
+        asyncio.run(scenario())
+
+    def test_image_mode_uses_configured_font_size(self) -> None:
+        """定时推送路径：image_font_size 要真正进入长图 HTML。"""
+
+        async def scenario() -> None:
+            send = FakeSend()
+            render = FakeRender()
+            plugin = build_plugin(
+                self.tmp,
+                send=send,
+                render=render,
+                push={"message_format": "image", "image_font_size": 26},
+            )
+            plugin._store.subscribe("s1", "10001")
+            self.assertTrue(await plugin._push_one("s1", make_issue("2026-10-19")))
+            self.assertEqual(len(render.calls), 1)
+            html = render.calls[0]["html"]
+            self.assertIn(".item-body{font-size:26px", html)
+            self.assertIn("h1{font-size:50.3px", html)  # 26 * 29/15，保留 1 位
+            self.assertEqual(len(send.image_calls), 1)
+
+        asyncio.run(scenario())
+
+    def test_manual_image_issue_uses_configured_font_size(self) -> None:
+        """/早报 路径与定时推送共用同一个 HTML 渲染入口，字号同样生效。"""
+
+        async def scenario() -> None:
+            send = FakeSend()
+            render = FakeRender()
+            plugin = build_plugin(
+                self.tmp,
+                send=send,
+                render=render,
+                push={"message_format": "image", "image_font_size": 24},
+            )
+            self.assertTrue(
+                await plugin._send_image_issue(make_issue("2026-10-19"), "s1")
+            )
+            self.assertEqual(len(render.calls), 1)
+            self.assertIn(".item-body{font-size:24px", render.calls[0]["html"])
+            self.assertEqual(len(send.image_calls), 1)
 
         asyncio.run(scenario())
 
