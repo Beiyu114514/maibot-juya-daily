@@ -241,6 +241,42 @@ class HtmlFallbackTest(unittest.TestCase):
         self.assertEqual(issue.date, "2026-10-19")
         self.assertIn("要闻速览", issue.content)
 
+    def test_fetch_from_html_picks_latest_dated_link(self) -> None:
+        """首页置顶旧文/推荐位时，兜底应按链接日期取最新，而非 links[0]。"""
+        home = (
+            '<a href="/issues/2026-10-10/">置顶旧文</a>'
+            '<a href="/issues/2026-10-19/">最新一期</a>'
+            '<a href="/issue-3/">旧格式</a>'
+        ).encode("utf-8")
+        fetched: list[str] = []
+
+        async def fake_get(url: str, logger) -> bytes:
+            if url == fetcher_module.SITE_URL:
+                return home
+            fetched.append(url)
+            return self.page.encode("utf-8")
+
+        with mock.patch.object(fetcher_module, "_http_get", fake_get):
+            issue = asyncio.run(JuyaFetcher(LOGGER)._fetch_from_html())
+        assert issue is not None
+        self.assertEqual(fetched, ["https://daily.juya.uk/issues/2026-10-19/"])
+        self.assertEqual(issue.link, "https://daily.juya.uk/issues/2026-10-19/")
+        self.assertEqual(issue.date, "2026-10-19")
+
+    def test_fetch_from_html_old_format_falls_back_to_first(self) -> None:
+        """全是 issue-N 旧格式无法比日期时，保持原行为取第一个匹配。"""
+        home = b'<a href="/issue-3/">old</a><a href="/issue-2/">older</a>'
+
+        async def fake_get(url: str, logger) -> bytes:
+            if url == fetcher_module.SITE_URL:
+                return home
+            return self.page.encode("utf-8")
+
+        with mock.patch.object(fetcher_module, "_http_get", fake_get):
+            issue = asyncio.run(JuyaFetcher(LOGGER)._fetch_from_html())
+        assert issue is not None
+        self.assertEqual(issue.link, "https://daily.juya.uk/issue-3/")
+
     def test_fetch_latest_falls_back_when_rss_fails(self) -> None:
         async def fake_get(url: str, logger) -> bytes:
             if url == fetcher_module.RSS_URL:

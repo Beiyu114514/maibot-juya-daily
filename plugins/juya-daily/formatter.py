@@ -273,8 +273,10 @@ def paginate_issue(
             rendered.append("\n".join(lines))
         else:
             rendered.append("\n".join([f"（第 {index + 1}/{total} 页）", "\n\n".join(blocks)]))
-    # 装页时已预留页码预算；这里兜底，任何回归都会在测试里立刻暴露
-    assert all(len(page) <= limit for page in rendered), "分页超过单条上限"
+    # 装页时已预留页码预算；这里兜底，任何回归都会在测试里立刻暴露。
+    # 不用 assert：宿主以 python -O 运行时断言会被剥掉，保护随之消失
+    if any(len(page) > limit for page in rendered):
+        raise ValueError("分页超过单条上限")
     return rendered
 
 
@@ -346,7 +348,9 @@ def paginate_issue_markdown(
         else:
             parts = [marker, *blocks] if marker else list(blocks)
         rendered.append("\n\n".join(part for part in parts if part))
-    assert all(len(page) <= limit for page in rendered), "Markdown 分页超过单条上限"
+    # 同上：不用 assert，防 python -O 剥断言后保护消失
+    if any(len(page) > limit for page in rendered):
+        raise ValueError("Markdown 分页超过单条上限")
     return rendered
 
 

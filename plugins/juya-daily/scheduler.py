@@ -88,6 +88,8 @@ class DailyScheduler:
     def _next_run(self, now: datetime | None = None) -> datetime:
         hour, minute = self._parse_push_time()
         now = now or self._now_fn()
+        # now_fn 固定为东八区 now_cst（无夏令时），replace 不会遇到
+        # 目标时刻不存在/重复的跳跃问题；若换用其他时区需改用 date 算术
         target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
         if target <= now:
             target += timedelta(days=1)

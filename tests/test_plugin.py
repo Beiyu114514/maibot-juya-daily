@@ -699,9 +699,12 @@ class PushTest(unittest.TestCase):
                     slept.append(delay)
 
             real_asyncio = plugin_module.asyncio
+            real_random = plugin_module.random
             plugin_module.asyncio = _NoSleepAsyncio(real_asyncio)  # type: ignore[assignment]
+            plugin_module.random = _NoStaggerRandom(real_random)
             try:
                 issue = make_issue("2026-10-19")
+                plugin._store.subscribe("s1", "10001")  # _push_batch 会跳过未订阅会话
                 calls = {"n": 0}
 
                 async def flaky(stream_id, text):
@@ -712,10 +715,19 @@ class PushTest(unittest.TestCase):
                 await plugin._retry_failed(["s1"], issue)
             finally:
                 plugin_module.asyncio = real_asyncio
+                plugin_module.random = real_random
             self.assertEqual(plugin._store.last_pushed_date("s1"), "2026-10-19")
             self.assertEqual(slept, [600, 600])  # 第 1 轮失败 → 第 2 轮重试成功
 
         asyncio.run(scenario())
+
+    def test_effective_deadline_cross_validated_with_push_time(self) -> None:
+        """push_time >= stale_deadline 时，生效 deadline 抬到 push_time + 30 分钟。"""
+        plugin = build_plugin(self.tmp, schedule={"push_time": "14:00"})
+        self.assertEqual(plugin._effective_deadline(), (14, 30))
+
+        plugin = build_plugin(self.tmp)
+        self.assertEqual(plugin._effective_deadline(), (12, 0))  # 默认 09:30 / 12:00 正常
 
 
 class MarkdownPushTest(unittest.TestCase):

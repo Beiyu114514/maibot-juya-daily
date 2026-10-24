@@ -231,9 +231,43 @@ class JuyaDailyPlugin(MaiBotPlugin):
     _PUSH_CONCURRENCY = 8  # 同时在飞的发送数上限，防止瞬时打爆平台
     _MANUAL_COOLDOWN = 60.0  # /早报 同一会话的抓取冷却（秒）
     _STATIC_RETRY_SECONDS = 300  # 静态群解析失败后的重试冷却
+    _STALE_BUFFER_MINUTES = 30  # push_time 晚于 stale_deadline 时，给 deadline 的缓冲
     _ADMIN_ROLES = {"admin", "owner", "superuser", "administrator"}
 
     # ---------- 生命周期 ----------
+
+    def _effective_deadline(self) -> tuple[int, int]:
+        """stale_deadline 的生效值，做 push_time 交叉校验。
+
+        用户若把 push_time 配得晚于 stale_deadline（如 14:00 > 12:00），
+        到点触发时已过 deadline，当天推送会被静默丢弃。这里在取值时
+        就把生效 deadline 抬到 push_time + 缓冲，保证「等今天一期」
+        至少能等到推送时间之后，而不是永远立刻放弃。
+        """
+        push_h, push_m = parse_hhmm(
+            self.config.schedule.push_time, (9, 30), self.ctx.logger
+        )
+        hour, minute = parse_hhmm(
+            self.config.push.stale_deadline, (12, 0), self.ctx.logger
+        )
+        push_minutes = push_h * 60 + push_m
+        deadline_minutes = hour * 60 + minute
+        if deadline_minutes <= push_minutes:
+            effective = push_minutes + self._STALE_BUFFER_MINUTES
+            self.ctx.logger.warning(
+                "stale_deadline %02d:%02d 不晚于 push_time %02d:%02d，"
+                "生效的当日放弃时间调整为 %02d:%02d（push_time + %d 分钟缓冲），"
+                "请在配置中把 stale_deadline 设为晚于 push_time",
+                hour,
+                minute,
+                push_h,
+                push_m,
+                effective // 60,
+                effective % 60,
+                self._STALE_BUFFER_MINUTES,
+            )
+            return effective // 60, effective % 60
+        return hour, minute
 
     async def on_load(self) -> None:
         self._tasks: set[asyncio.Task] = set()
@@ -313,6 +347,8 @@ class JuyaDailyPlugin(MaiBotPlugin):
                     now_fn=now_cst,
                 )
                 await self._scheduler.start()
+            # 交叉校验 stale_deadline 与新 push_time，配错时尽早给出 warning
+            self._effective_deadline()
         except Exception:
             self.ctx.logger.exception("应用新配置失败")
 
@@ -329,6 +365,12 @@ class JuyaDailyPlugin(MaiBotPlugin):
             await self._reply(kwargs, "刚拉过一次，稍等一分钟再试~")
             return (True, "throttled", 2)
         if stream_id:
+            # 写入前清理过期项，防止长期运行时按会话累积的慢速内存泄漏
+            if len(fetch_times) > 1000:
+                cutoff = now - self._MANUAL_COOLDOWN
+                for sid, ts in list(fetch_times.items()):
+                    if ts < cutoff:
+                        del fetch_times[sid]
             fetch_times[stream_id] = now
         try:
             issue = await self._fetch_latest_shared()
@@ -398,6 +440,8 @@ class JuyaDailyPlugin(MaiBotPlugin):
             f"本会话订阅：{'是' if stream_id and stream_id in subs else '否'}",
             f"总订阅数：{len(subs)}（另含静态群 {len(self._static_stream_ids)} 个）",
             f"推送时间：每天 {self.config.schedule.push_time}（东八区 UTC+8）",
+            f"当日放弃时间：{self.config.push.stale_deadline}"
+            f"（生效 %02d:%02d）" % self._effective_deadline(),
         ]
         if next_run:
             lines.append(f"下次推送：{next_run.strftime('%m-%d %H:%M')}")
@@ -855,12 +899,11 @@ class JuyaDailyPlugin(MaiBotPlugin):
         interval = max(1, int(self.config.push.retry_minutes or 10)) * 60
         for round_no in range(1, rounds + 1):
             await asyncio.sleep(interval)
-            still_failed: list[str] = []
-            for stream_id in failed:
-                if await self._push_one(stream_id, issue):
-                    self.ctx.logger.info("重试第 %d 轮成功: %s", round_no, stream_id)
-                else:
-                    still_failed.append(stream_id)
+            # 复用 _push_batch：获得与定时轮一致的信号量并发、错峰与异常兜底，
+            # 不会因单个会话卡住拖慢整轮重试
+            still_failed = await self._push_batch(failed, issue)
+            for stream_id in still_failed:
+                self.ctx.logger.info("重试第 %d 轮仍失败: %s", round_no, stream_id)
             failed = still_failed
             if not failed:
                 return
@@ -914,9 +957,9 @@ class JuyaDailyPlugin(MaiBotPlugin):
         self._spawn(self._wait_for_today_issue(today, due), "wait-today-issue")
 
     async def _wait_for_today_issue(self, today: str, due: list[str]) -> None:
-        hour, minute = parse_hhmm(
-            self.config.push.stale_deadline, (12, 0), self.ctx.logger
-        )
+        # deadline 取交叉校验后的生效值：push_time >= stale_deadline 时
+        # 已在 _effective_deadline 里抬到 push_time + 缓冲，避免到点即放弃
+        hour, minute = self._effective_deadline()
         deadline = dtime(hour, minute)
 
         def _now_cst_time() -> dtime:

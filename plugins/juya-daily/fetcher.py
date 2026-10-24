@@ -25,8 +25,8 @@ SITE_URL = "https://daily.juya.uk/"
 CST = timezone(timedelta(hours=8))
 
 
-# manifest 读不到时的兜底版本号，发版时与 _manifest.json 一起改
-_FALLBACK_VERSION = "0.3.1"
+# manifest 读不到时的兜底版本号；不跟随发版同步，避免像 0.3.1 那样长期落后
+_FALLBACK_VERSION = "unknown"
 
 
 def _plugin_version() -> str:
@@ -327,7 +327,18 @@ class JuyaFetcher:
             if not links:
                 self.logger.warning("首页没有找到 issue 链接，HTML 兜底失败")
                 return None
-            first = links[0]
+            # 兜底本来就是为「站点改版」准备的，而改版可能连首页排列顺序一起变
+            # （置顶旧文、推荐位等），links[0] 不再可信；按链接里的日期取最新，
+            # issue-N 旧格式无法比日期时才退回第一个匹配
+            dated = [
+                (m.group(1), link)
+                for link in links
+                if (m := re.search(r"issues/(20\d{2}-\d{2}-\d{2})/?", link))
+            ]
+            if dated:
+                first = max(dated, key=lambda pair: pair[0])[1]
+            else:
+                first = links[0]
             if first.startswith("http"):
                 link = first
             elif first.startswith("/"):
@@ -339,6 +350,13 @@ class JuyaFetcher:
             if not body:
                 return None
             date = _extract_date(title) or _extract_date(body[:500]) or ""
+            link_date = dated and max(dated, key=lambda pair: pair[0])[0]
+            if date and link_date and date != link_date:
+                self.logger.warning(
+                    "页面日期 %s 与链接日期 %s 不一致（站点可能改版），请检查抓取结果",
+                    date,
+                    link_date,
+                )
             self.logger.info("HTML 兜底成功: %s (%s)", title or link, date or "日期未知")
             return Issue(
                 title=title or f"橘鸦AI早报 {date}".strip(),
